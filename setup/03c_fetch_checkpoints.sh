@@ -8,7 +8,9 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$HERE"
 
-URL=https://github.com/wpfs-anon/WPFS/releases/download/checkpoints
+# kept apart so that an anonymising mirror of this repository leaves the URL alone
+OWNER=wpfs-anon REPO=WPFS
+URL=https://github.com/$OWNER/$REPO/releases/download/checkpoints
 
 # sha256                                                            destination
 while read -r sha dst; do
