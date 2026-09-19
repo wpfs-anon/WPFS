@@ -1,0 +1,14 @@
+.venv/
+openpi/
+LIBERO/
+openpi_assets/
+distill/
+ckpt/
+assets/
+logs/
+clips/
+__pycache__/
+*.pyc
+*.npy
+checkpoints/**/*.pt
+*.part

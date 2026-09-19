@@ -1,0 +1,11 @@
+{
+  "model": "pi05",
+  "horizon": 10,
+  "k": 4,
+  "reps": 40,
+  "compile": "default",
+  "latency_ms": {
+    "plan-plan": 63.00413369999944,
+    "27-18": 43.28512904999968
+  }
+}

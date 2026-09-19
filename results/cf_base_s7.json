@@ -1,0 +1,41 @@
+{
+  "suite": "libero_spatial",
+  "tasks": 10,
+  "trials": 5,
+  "seed": 7,
+  "replan": 10,
+  "c": 25,
+  "tau0": 0.5,
+  "fallback": 0.0,
+  "max_corrections": 0,
+  "grip": "correct",
+  "natural": 0.522839367389679,
+  "L_plan": 57.806388050084934,
+  "L_corr": 39.58093782493961,
+  "compile": "default",
+  "results": {
+    "baseline": {
+      "success": 49,
+      "episodes": 50,
+      "rate": 98.0,
+      "steps": 5425,
+      "plans": 567,
+      "corrections": 0,
+      "fallbacks": 0,
+      "exhausted": 0,
+      "frac_exhausted": 0.0,
+      "steps_per_plan": 9.567901234567902,
+      "ms_per_step": 6.041699912331458,
+      "wall_s": 156.40478324890137,
+      "disp_median": null,
+      "disp_p90": null,
+      "grip_ambiguity": null,
+      "grip_amb_p90": null,
+      "grip_amb_p99": null,
+      "grip_amb_max": null,
+      "grip_flip_rate": null,
+      "grip_chatter": null,
+      "grip_chatter_stale": null
+    }
+  }
+}
