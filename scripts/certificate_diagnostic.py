@@ -1,32 +1,7 @@
-"""Does the certificate see anything?
-
-The acceptance test rejects a chunk position when the K draws disagree there by
-more than agree_tau x SREF.  That is only useful if disagreement actually marks
-the positions where the corrector is wrong.  For the teacher it does -- that is
-why SREF means something.  For a distilled student nobody has checked, and a
-student whose draws scatter by the right AMOUNT in the wrong PLACES would look
-perfect on every metric we have tracked while leaving the certificate blind.
-
-Two numbers per checkpoint, both computed per chunk position:
-
-  corr    Spearman between draw spread and error against the teacher.  If this
-          is near zero the test cannot tell a good correction from a bad one.
-
-  ratio   mean error of the positions the test REJECTS over the positions it
-          ACCEPTS, at the operating threshold the driver uses.  This is the
-          quantity the mechanism actually depends on: above 1 the test removes
-          worse-than-average positions, at 1 it removes nothing useful.
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 
 import argparse, math, os, sys
 for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"): os.environ.setdefault(v, "8")
@@ -90,15 +65,14 @@ def spearman(a, b):
 
 
 def per_position(out_s, out_t):
-    """spread and error at each of the first CMAX positions, pose channels only."""
     K = out_s.shape[0]
     pairs = [(a, b) for a in range(K) for b in range(a + 1, K)]
     spread = torch.stack([torch.linalg.vector_norm(
         out_s[a, :CMAX, :POSE] - out_s[b, :CMAX, :POSE], dim=-1)
-        for a, b in pairs]).median(dim=0).values          # (CMAX,)
+        for a, b in pairs]).median(dim=0).values
     err = torch.linalg.vector_norm(
         out_s[:, :CMAX, :POSE].mean(0) - out_t[:, :CMAX, :POSE].mean(0),
-        dim=-1)                                            # (CMAX,)
+        dim=-1)
     return spread.cpu(), err.cpu()
 
 
@@ -129,7 +103,6 @@ from sentry.models.openpi_adapter import load_pi0_pytorch
 model = load_pi0_pytorch(f"{HOME}/openpi_assets/pi0_libero_pytorch", device=dev)
 model.eval()
 
-# --- the from-scratch nets
 from sentry.models.openpi_adapter import OpenPiBackend
 be_plain = OpenPiBackend(model, device=dev, M=10, attach_adapters=False)
 from student_net import NetCorrector
@@ -148,7 +121,6 @@ for path in [q.strip() for q in args.nets.split(",") if q.strip()]:
     del nc
     torch.cuda.empty_cache()
 
-# --- the LoRA student, the one config that reached parity in the loop
 if args.lora and os.path.exists(args.lora):
     st = torch.load(args.lora, weights_only=False)
     from sentry.models.lora import set_adapter_slot

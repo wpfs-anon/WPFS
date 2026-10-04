@@ -1,32 +1,7 @@
-"""Side-by-side video of the episodes where pi_0 fails and the corrector does not.
-
-Two passes, because which episodes diverge is not known until both have run and
-holding every frame of 100 episodes in memory to find out would cost gigabytes:
-
-  1. run both loops over the whole suite, recording only success per episode
-  2. re-run just the divergent ones with rendering on
-
-The seeds make this exact rather than approximate.  The noise for the n-th draw
-of a given (task, trial) comes from a generator seeded by that triple, so pass 2
-reproduces pass 1 frame for frame, and the two loops see identical noise wherever
-they make identical choices.  The draw ORDER therefore has to match the driver
-exactly -- plan noise first, then K-wide eps per correction -- or the replay
-diverges from the run it is supposed to be showing.
-
-Left panel is pi_0 replanning every 10 steps; right is the adaptive corrector.
-The instruction is drawn above both, since a viewer cannot tell whether a
-trajectory succeeded without knowing what it was asked to do.
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 
 
 import argparse
@@ -183,9 +158,6 @@ def to_observation(raw, tokens, t):
 
 @torch.no_grad()
 def integrate(x0, tau0, n, obs, E_V=None, E_B=None):
-    """A call that names no depth is a CORRECTION and takes the student when one
-    is loaded.  The reference plans behind SREF pass full depth explicitly: they
-    are the yardstick and must not move when the corrector changes."""
     ev = (S_EV if (E_V is None and S_EV is not None)
           else (FULL_V if E_V is None else E_V))
     eb = (S_EB if (E_B is None and S_EB is not None)
@@ -194,7 +166,6 @@ def integrate(x0, tau0, n, obs, E_V=None, E_B=None):
     x = x0.clone().float().to(be.device)
     tau = tau0.clone().float().to(be.device)
     step = (tau / max(n, 1)).view(-1, 1, 1)
-    # One memory per correction, shared by the K draws, exactly as trained.
     mem = NET.memory(obs) if (NET is not None and E_V is None) else None
     for _ in range(n):
         if mem is not None:
@@ -226,7 +197,7 @@ class Env:
         self._t, self._done = 0, False
         self._anchor = raw_state(t0_raw)
         self.frames = [agentview(t0_raw)] if record else None
-        self.marks = []          # (step, kind) for the caption strip
+        self.marks = []
 
     def mark_plan_anchor(self):
         self._anchor = raw_state(self._raw)
@@ -253,9 +224,6 @@ class Env:
         return self._done
 
 
-# ==========================================================================
-# the two loops -- draw order must match 43_corrector_loop.py exactly
-# ==========================================================================
 @torch.no_grad()
 def run_baseline(env, gen, T_max):
     steps, plans = 0, 0
@@ -316,13 +284,6 @@ def run_adaptive(env, gen, T_max, SREF):
             env.mark_plan_anchor()
             env.marks.append((steps, f"correct N={n_agree}"))
 
-        # Exactly the driver's bookkeeping, including the part that looks
-        # wrong: the segment is NOT clamped to the chunk's remaining planned
-        # content, so a late segment runs past H and into the hold-padding.
-        # Clamping it here -- which is what a careful reimplementation does --
-        # changed 50/50 into 46/50, because the trajectories separate the first
-        # time a segment would have overrun.  A replay that improves on the run
-        # it is illustrating is still the wrong replay.
         seg = args.c_safe if just_planned else max(args.n_min,
                                                    min(n_agree, args.c_max))
         capped = used + seg >= H
@@ -338,9 +299,6 @@ def run_adaptive(env, gen, T_max, SREF):
     return dict(steps=steps, plans=plans, corrections=corrections)
 
 
-# ==========================================================================
-# setup
-# ==========================================================================
 suite = benchmark.get_benchmark_dict()[args.suite]()
 n_tasks = min(args.tasks, suite.n_tasks)
 T_max = MAX_STEPS[args.suite]
@@ -387,15 +345,6 @@ else:
         integrate(torch.randn(args.k_draws, H, D), torch.full((args.k_draws,), 0.5),
                   1, _obs)
 
-# Per-position reference spread -- the scale every acceptance decision is made
-# against, so it has to be built by the driver's procedure exactly.
-#
-# The first attempt advanced the probe env with a normalised zero action through
-# the wrapper, which denormalises to spec.mean plus the anchor: a real motion
-# command, not a no-op.  The driver steps the RAW env with DUMMY.  The probe
-# observations were therefore taken somewhere else entirely, SREF came out
-# different, and every accept/reject downstream drifted with it -- 47/50 instead
-# of 50/50, from a line that looks like it does nothing.
 _perpos = []
 with torch.no_grad():
     for _tid in range(min(4, n_tasks)):
@@ -427,9 +376,6 @@ _e.close()
 print(f"  per-position spread h=0 {SREF[0]:.3f}  h={len(SREF)-1} {SREF[-1]:.3f}")
 
 
-# ==========================================================================
-# pass 1 -- who diverges
-# ==========================================================================
 def episode_gen(tid, trial):
     return torch.Generator().manual_seed(
         args.seed * 1_000_003 + tid * 10_007 + trial * 101)
@@ -471,9 +417,6 @@ for r in loss:
     print(f"    LOSS task {r['task']} trial {r['trial']}  {r['language'][:56]}")
 
 
-# ==========================================================================
-# pass 2 -- render
-# ==========================================================================
 FONT = None
 for cand in ("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
              "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"):
@@ -541,7 +484,7 @@ for r in _pick[:args.max_clips]:
         nc = len([m for m in mb if m[0] <= i and m[1].startswith("correct")])
         lb = f"adaptive τ=1.0   ({nb} plans, {nc} corrections)"
         vw.write(compose(fa[i], fb[i], r["language"], la, lb, ok_a, ok_b, i, n))
-    for _ in range(args.fps):                      # hold the last frame
+    for _ in range(args.fps):
         vw.write(compose(fa[-1], fb[-1], r["language"], la, lb, ok_a, ok_b, n, n))
     vw.release()
     rendered.append(path)

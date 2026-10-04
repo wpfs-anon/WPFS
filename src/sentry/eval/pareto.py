@@ -1,18 +1,3 @@
-"""The success-versus-speedup Pareto curve, traced by sweeping ``alpha``.
-
-SS2.4.4: "The corresponding rejection rate on the live population is not
-controlled and is instead the efficiency the system achieves; **sweeping alpha
-traces the success-versus-speedup Pareto curve that we report in place of a
-single operating point.**"
-
-So ``alpha`` is the dial, and the deliverable is a curve.  Each point is a full
-re-calibration: ``alpha`` sets ``delta`` through equation 12, ``delta`` sets how
-readily the operator accepts, and that in turn sets both how often the target is
-invoked and how often a stale plan slips through.
-
-Run: ``python -m sentry.eval.pareto``
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -47,8 +32,6 @@ class ParetoPoint:
     gain_ratio: float
     L_step: float
     speedup: float
-    """Against the strongest fixed baseline that still succeeds -- see
-    :func:`sweep`."""
     holdout_false_acceptance: float
     holdout_live_rejection: float
 
@@ -63,14 +46,6 @@ def sweep(
     baseline_N_exec: int = 8,
     seed: int = 0,
 ) -> list[ParetoPoint]:
-    """Re-calibrate at each ``alpha`` and re-run the suite.
-
-    The calibration *records* are computed once and reused across ``alpha``:
-    the underlying statistics do not depend on the threshold, only the quantile
-    taken from them does.  This is the same amortisation SS2.9 describes for
-    Stage-B data generation -- "we cache one plan per anchor and reuse it
-    across all k, tau, eps and depth draws".
-    """
     regime = regime or REGIMES[1]
 
     samples = generate(
@@ -89,9 +64,6 @@ def sweep(
                 records, alpha=alpha, mode=rig.cfg.calibration_mode, seed=seed
             )
         except ValueError:
-            # A degenerate threshold at very small alpha means the stale
-            # population is not separated from zero there.  Skip rather than
-            # report a fabricated operating point.
             continue
 
         total = EpisodeTrace()
@@ -132,7 +104,6 @@ def sweep(
 
 
 def frontier(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
-    """Keep only the non-dominated points on the (success, speedup) plane."""
     out: list[ParetoPoint] = []
     for p in sorted(points, key=lambda q: (-q.success_rate, -q.speedup)):
         if not any(
@@ -143,7 +114,7 @@ def frontier(points: Sequence[ParetoPoint]) -> list[ParetoPoint]:
     return out
 
 
-def main() -> None:  # pragma: no cover - reporting
+def main() -> None:
     rig = build_rig()
     regime = REGIMES[1]
     points = sweep(rig, regime=regime)
@@ -184,5 +155,5 @@ def main() -> None:  # pragma: no cover - reporting
     )
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

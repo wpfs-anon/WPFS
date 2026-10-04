@@ -1,31 +1,3 @@
-r"""Diagnostic D1: is verification actually easier than planning? (SS2.8)
-
-"The premise of the method is that a decision requires less depth than a
-generation.  This is measurable and we treat it as a **gate on the whole
-approach** rather than as an assumption."
-
-On held-out rollouts, and for each depth ``(E_V, E_B)``, three statistics are
-computed **on the same inputs**:
-
-===========  =============================================  ====================
-statistic    definition                                      isolates
-===========  =============================================  ====================
-``d_prune``  disagreement of eq. 9 at reduced depth against  truncation error
-             full depth, *under the same observation*
-``d_stale``  disagreement at full depth under the *fresh*    the signal to detect
-             observation
-``d_both``   the deployed statistic                          what is actually used
-===========  =============================================  ====================
-
-"The method is viable only in the regime ``d_prune << d_stale``, and the
-operative summary is the AUC of ``d_both`` as a detector of the label ``y``,
-plotted against depth and broken down by manipulation phase.  The resulting
-curve converts 'verification is easier than planning' from a slogan into a
-measurement, and **it also determines the depth ladder of Sec. 2.6**."
-
-Run: ``python -m sentry.eval.d1``
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -47,22 +19,16 @@ __all__ = ["D1Row", "diagnose", "auc", "recommend_ladder", "main"]
 
 @dataclass(frozen=True)
 class D1Row:
-    """D1 at one depth."""
 
     rung: DepthRung
     d_prune: float
-    """Median truncation error: reduced vs full depth, same observation."""
     d_stale: float
-    """Median detection signal: full depth, fresh observation, stale samples."""
     auc: float
-    """AUC of ``d_both`` as a detector of the liveness label."""
     per_phase_auc: dict[str, float]
     separation: float
-    """``d_stale / d_prune``.  The regime the method needs is ``>> 1``."""
 
     @property
     def viable(self) -> bool:
-        """SS2.8's gate: "viable only in the regime ``d_prune << d_stale``"."""
         return self.separation >= 3.0 and self.auc >= 0.9
 
 
@@ -75,48 +41,22 @@ def _statistic(
     eps: torch.Tensor,
     reference: Optional[torch.Tensor] = None,
 ) -> tuple[float, torch.Tensor]:
-    """Max-channel distance of eq. 9's reconstruction at ``rung``, at position 0.
-
-    When ``reference`` is given, the disagreement is measured against it rather
-    than against the candidate -- that is what separates ``d_prune`` (reduced
-    vs full depth) from ``d_both`` (reduced vs candidate).
-
-    **Read at position 0, not averaged over the chunk.**  Acceptance is a
-    prefix rule (eq. 11), so a plan is rejected precisely when position 0
-    fails, and SS2.4.4 defines the controlled quantity as "the probability of
-    accepting a *step* whose plan is not live".  Reducing over all ``H_k``
-    positions instead would let the tail dominate: once the end-effector
-    reaches its target both plans emit zero motion, so most positions agree by
-    construction and the median collapses towards zero even for a badly stale
-    plan.  :func:`sentry.core.calibration.harvest` reads position 0 for the
-    same reason; the two must agree or D1 is not diagnosing the deployed
-    statistic.
-    """
     R, _, _ = renoise_and_reconstruct(
         backend=backend, A_hat=sample.A_hat, obs=sample.obs, rung=rung,
         taus=cfg.taus, convention=cfg.tau_convention, eps=eps, adapters=True,
     )
     if reference is None:
         d_pos, d_rot = acceptance.raw_distances(R, sample.A_hat, spec, sample.H_k)
-        d = torch.maximum(d_pos, d_rot).max(dim=0).values   # (H_k,), conservative over T
+        d = torch.maximum(d_pos, d_rot).max(dim=0).values
         return float(d[0].item()), R
 
-    # ``d_prune`` compares the reduced-depth reconstruction against the
-    # full-depth one **at the same tau**.  Comparing every tau against
-    # ``reference[0]`` instead folds the tau-to-tau spread of the full-depth
-    # reconstruction into what is supposed to be pure truncation error: measured
-    # on pi0_libero that inflated d_prune by ~0.7, and it showed up as a
-    # full-depth rung reporting d_prune = 0.71 where the definition requires
-    # exactly 0.  It does not change any verdict here, because the truncated
-    # rungs sit far above either number -- but the whole point of D1 is that
-    # d_prune "isolates truncation error", so it has to isolate only that.
     per_tau = []
     for j in range(R.shape[0]):
         d_pos, d_rot = acceptance.raw_distances(
             R[j : j + 1], reference[j], spec, sample.H_k
         )
         per_tau.append(torch.maximum(d_pos, d_rot)[0])
-    d = torch.stack(per_tau).max(dim=0).values              # conservative over T
+    d = torch.stack(per_tau).max(dim=0).values
     return float(d[0].item()), R
 
 
@@ -125,7 +65,6 @@ def diagnose(
     samples: Sequence[Sample],
     ladder: Optional[Sequence[DepthRung]] = None,
 ) -> list[D1Row]:
-    """Compute D1 across a set of candidate depths."""
     cfg, spec = rig.cfg, rig.spec
     full = DepthRung(E_V=rig.oracle_cfg.L_V, E_B=rig.oracle_cfg.L_B)
     ladder = list(ladder or cfg.ladder)
@@ -140,34 +79,19 @@ def diagnose(
 
         for i, s in enumerate(samples):
             backend = rig.backend()
-            # One shared eps across all three statistics, so the comparison is
-            # "same inputs" as SS2.8 requires.
             eps = torch.randn(
                 s.A_hat.shape, generator=torch.Generator().manual_seed(i)
             )
 
-            # d_prune: reduced depth vs full depth, SAME observation.
             _, R_full = _statistic(backend, cfg, spec, s, full, eps)
             dp, _ = _statistic(backend, cfg, spec, s, rung, eps, reference=R_full)
             prune.append(dp)
 
-            # d_both: the deployed statistic -- reduced depth vs the candidate.
             db, _ = _statistic(backend, cfg, spec, s, rung, eps)
             both.append(db)
 
-            # d_stale: full depth under the fresh observation.
             ds, _ = _statistic(backend, cfg, spec, s, full, eps)
 
-            # The label must be Definition 1's, not the generator's intent.
-            # SS2.8 asks for "the AUC of d_both as a detector of the label y of
-            # Sec. 2.4.4", and that label comes from evaluating eq. 5 against a
-            # full-depth replan.  Using the generator tag instead would score
-            # N4 as a positive it can never detect: N4 corrupts the candidate
-            # from a random h0 >= 1, so at the horizon m the plan really is
-            # still live, and SS2.5.2 says so outright -- N4 "supplies a
-            # supervised target for the accepted *length* rather than for the
-            # binary label".  Counting it against the binary detector puts a
-            # ceiling on AUC that has nothing to do with depth.
             is_live, _ = liveness(
                 s.fresh_plan, s.A_hat, s.H_k, eps=cfg.liveness_eps, m=cfg.liveness_m
             )
@@ -201,10 +125,6 @@ def diagnose(
 
 
 def auc(scores: Sequence[float], labels: Sequence[int]) -> float:
-    """Area under the ROC curve, by the rank (Mann-Whitney U) identity.
-
-    ``labels``: 1 = stale (positive class, should score high), 0 = live.
-    """
     pos = [s for s, y in zip(scores, labels) if y == 1]
     neg = [s for s, y in zip(scores, labels) if y == 0]
     if not pos or not neg:
@@ -217,7 +137,7 @@ def auc(scores: Sequence[float], labels: Sequence[int]) -> float:
         j = i
         while j + 1 < len(order) and scores[order[j + 1]] == scores[order[i]]:
             j += 1
-        shared = (i + j) / 2 + 1  # average rank, 1-based, ties shared
+        shared = (i + j) / 2 + 1
         for k in range(i, j + 1):
             ranks[order[k]] = shared
         i = j + 1
@@ -228,14 +148,6 @@ def auc(scores: Sequence[float], labels: Sequence[int]) -> float:
 
 
 def recommend_ladder(rows: Sequence[D1Row], n: int = 3) -> list[DepthRung]:
-    """Pick a ladder from the D1 curve.
-
-    SS2.8: the D1 curve "also determines the depth ladder of Sec. 2.6", and
-    Table 2's caption confirms the ladder is "set by Diagnostic D1 ... rather
-    than tuned on the evaluation suites".  The shallowest viable rung goes
-    first, since the cascade starts there and escalates only when the margin is
-    thin; deeper viable rungs follow.
-    """
     viable = sorted((r for r in rows if r.viable), key=lambda r: r.rung.E_B)
     if not viable:
         return []
@@ -245,15 +157,13 @@ def recommend_ladder(rows: Sequence[D1Row], n: int = 3) -> list[DepthRung]:
     return [viable[round(i * step)].rung for i in range(n)]
 
 
-def main() -> None:  # pragma: no cover - reporting
+def main() -> None:
     rig = build_rig()
     samples = generate(
         rig.backend(), rig.cfg, rig.spec, n=200,
         gen_cfg=SampleGenConfig(env=rig.env_cfg), seed=7,
     )
 
-    # Sweep the whole depth range, not just the deployed ladder -- the point of
-    # D1 is to *choose* the ladder.
     L_V, L_B = rig.oracle_cfg.L_V, rig.oracle_cfg.L_B
     sweep = [
         DepthRung(E_V=max(1, round(L_V * eb / L_B)), E_B=eb)
@@ -298,5 +208,5 @@ def main() -> None:  # pragma: no cover - reporting
     )
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

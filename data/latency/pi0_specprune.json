@@ -1,0 +1,12 @@
+{
+ "model": "pi0",
+ "alpha": 2.0,
+ "dynamic_prune": false,
+ "global_from_expert": true,
+ "global_capture_every": 1,
+ "skip_masked_views": true,
+ "compile": "default",
+ "L_plan": 57.60134254996956,
+ "L_plan_specprune": 48.41962799982866,
+ "note": "per-plan latencies in ms measured on an idle RTX 5090; read by baselines/libero/*_eval.py --latency-from"
+}

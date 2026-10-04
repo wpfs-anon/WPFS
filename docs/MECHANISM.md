@@ -29,6 +29,52 @@ step from pure noise returns the conditional mean instead — which scores well 
 a nearest-plan metric while being a mode average, and is why the distance to a
 reference **centroid** is tracked alongside the distance to the nearest plan.
 
+### Measured, not asserted
+
+`scripts/staleness_probe.py` measures that paragraph without scoring a single
+episode. On a healthy rollout, with a chunk planned `k` steps ago, it draws 8
+fresh plans at the current observation and asks how far each candidate sits from
+that distribution: `d_nn` to the nearest of them, `d_cent` to their centroid,
+each divided by the reference plans' own — so 1.00 is "as far as two honest
+plans already are". 1,950 probes over 12 LIBERO-Spatial episodes, π₀, seed 7,
+scored over the 10 actions that would be executed next:
+
+| k | do nothing | 1 step from noise | τ₀ = 0.3 | **τ₀ = 0.5** | τ₀ = 0.7 |
+|---|---|---|---|---|---|
+| 1 | 0.71 / 1.09 | 0.84 / 0.60 | 0.83 / 0.85 | **0.81 / 0.64** | 0.82 / 0.56 |
+| 5 | 1.30 / 1.49 | 0.80 / 0.65 | 1.00 / 1.24 | **0.78 / 0.85** | 0.77 / 0.67 |
+| 10 | 1.53 / 1.88 | 0.81 / 0.64 | 1.11 / 1.43 | **0.88 / 1.02** | 0.78 / 0.70 |
+| 30 | 1.97 / 2.53 | 0.79 / 0.66 | 1.14 / 1.53 | **0.90 / 1.15** | 0.79 / 0.71 |
+
+`d_nn` / `d_cent`. A candidate is inside the distribution only when `d_nn ≤ 1`
+**and** `d_cent ≈ 1`. Three things follow, none of which needed a rollout:
+
+**The chunk does go stale.** Doing nothing leaves the distribution — at the
+tight band (the nearest other plan) from k = 3, and at the typical plan-to-plan
+spread at k = 10, which is where π₀'s own success-versus-replan curve turns
+over. Its `d_cent` grows with it, so the stale chunk drifts *away* from the plan
+cloud rather than toward its middle.
+
+**One step from the stale chunk brings it back, at every staleness.** τ₀ = 0.5
+holds `d_nn` at 0.78–0.93 from k = 1 to k = 30 while `d_cent` climbs to ≈ 1: not
+merely close to some plan, but as far from the centre as a plan should be.
+
+**Both cheap alternatives fail, in opposite directions.** One step from noise —
+and τ₀ = 0.7, which is nearly noise — posts the best `d_nn` of the table while
+sitting at `d_cent` 0.53–0.71: the conditional mean, a chunk the policy would
+never sample. τ₀ = 0.3 does not re-noise enough and stays stale, tracking the
+do-nothing row (`d_nn` > 1 from k = 8). So the operator's one hyperparameter is
+bracketed by two failure modes that a nearest-plan metric alone cannot tell
+apart, which is the reason both statistics are reported.
+
+A fourth observation, smaller: the ratio does not vary systematically along the
+chunk (at k = 10 it is 1.71 over positions 0–4, 1.62 over 10–14, 1.81 over the
+last five). Staleness is a property of elapsed time, not of position — which is
+why one re-noise level serves the whole chunk.
+
+`scripts/staleness_probe.py` writes every value to `ckpt/staleness/`, and
+`scripts/staleness_figure.py` draws the two-panel figure from it.
+
 ## What the acceptance test does
 
 The K draws differ only in ε. Where they agree, the correction is determined by
@@ -64,13 +110,9 @@ reproduces both halves of this.
 
 ## Distillation
 
-The corrector runs at every correction, so its cost is the thing to attack. Two
-students, both trained only against the teacher's velocity field, never against
+The corrector runs at every correction, so its cost is the thing to attack. The
+student is trained only against the teacher's velocity field, never against
 demonstrations:
-
-**LoRA student.** π₀ truncated to 14 prefix and 12 expert layers with LoRA
-adapters, ~7M trained parameters. Truncation alone destroys correction at every
-depth; the adapters repair it, relative L2 1.99 → 0.116.
 
 **Network student.** 27.8M parameters. The 50 chunk positions are the queries;
 π₀'s frozen SigLIP tokens plus its instruction embedding are the memory. Nothing
@@ -85,11 +127,9 @@ L = ‖v_s − v_t‖²  +  λ·‖σ_h(student) − σ_h(teacher)‖²
 ```
 
 where σ_h is the mean pairwise distance between draws at position h, computed on
-`x − τ₀·v`. At λ = 1 the disagreement ratio settles at 1.06 instead of 1.10, and
-velocity accuracy improves too (0.155 → 0.145) — constraining how the model must
-respond to its own input noise appears to regularise what it learns. In the
-rollout this is worth 2.7 points: −1.29 at λ = 0 against +1.43 at λ = 1, at the
-same speed and the same replan cadence.
+`x − τ₀·v`. Without the second term nothing keeps the student's draw spread at the
+teacher's, and the certificate would read a different quantity than the one it was
+calibrated on.
 
 ## Cost
 
@@ -98,7 +138,6 @@ Measured on an RTX 5090, compiled, batch 4, idle GPU:
 | | ms |
 |---|---|
 | plan (10 steps, full depth, 3 cameras) | 57.81 |
-| correction, LoRA student at (14, 12) | 26.52 |
 | correction, network student | 7.57 |
 | ├ vision encoder, 2 cameras | 6.25 |
 | └ the network itself, K=4 draws | 1.27 |

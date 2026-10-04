@@ -1,56 +1,7 @@
-"""The corrector loop, end to end, against pi_0 replanning -- success, not geometry.
-
-Three gates got the direction this far, and all three measured the same proxy:
-whether a corrected chunk lands inside the distribution of plans the target
-would draw right now.  That is a proxy.  This runs the loop:
-
-    BASELINE    plan at full depth, execute N actions, plan again.
-    CORRECTOR   plan at full depth ONCE, then forever: take the live suffix,
-                re-noise it to model-time tau0, run ONE velocity evaluation
-                under the CURRENT observation, execute c actions of the result,
-                repeat.
-
-Nothing is trained.  The corrector is the target's own flow field, queried once
-instead of ten times, from the previous chunk instead of from noise.  If this
-holds success, the first contribution of the paper needs no new weights at all.
-
-Two things the probe gates could not see, and this one does:
-
-  * COMPOUNDING.  Every probe corrected a chunk the TARGET had planned.  Here
-    correction n+1 acts on the output of correction n, so whatever error the
-    operator introduces is fed back into itself.  This is the failure mode most
-    likely to kill the direction, and it cannot be measured any other way.
-  * WHETHER GEOMETRY IS THE RIGHT PROXY.  A chunk can sit inside the plan
-    distribution and still not accomplish the task.
-
-Latency is NOT timed here.  The GPU is shared with another job, and a contended
-clock produces a speedup that is an artefact of scheduling.  Instead the loop
-counts the operations it performs -- full plans and single-evaluation
-corrections -- and the report multiplies those counts by per-call costs measured
-on an idle GPU (gate_depth_s7.json).  Counts are exact and contention-free; the
-cost table is the one every earlier number in this line of work already used.
-
-Conventions that cost previous sessions real time:
-
-  * openpi integrates model-time 1 -> 0 with x = t*noise + (1-t)*clean, so t=1
-    is pure NOISE and t=0 is clean, and one Euler step is x <- x - dt*v.
-  * pi0_libero writes the six pose channels as (action - state) against ONE
-    anchor per chunk.  A correction produces a chunk conditioned on the CURRENT
-    observation, so its deltas are relative to the current state: the anchor
-    must be re-marked at every correction, exactly as it is at every plan.
-    Forgetting that would leave the robot executing deltas against a state it
-    left twenty steps ago.
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 
 import argparse
 import collections
@@ -271,21 +222,12 @@ CONV, RAW = {
             f"{HOME}/openpi_assets/pi0_libero"),
     "pi05": (f"{HOME}/openpi_assets/pi05_libero_pytorch",
              f"{HOME}/openpi_assets/pi05_libero"),
-    # convert_lerobot_pi05.py writes weights, config and norm_stats in one place
     "lerobot05": (f"{HOME}/openpi_assets/lerobot_pi05_libero_pytorch",
                   f"{HOME}/openpi_assets/lerobot_pi05_libero_pytorch"),
 }[args.model]
 PI05 = args.model == "pi05"
-# pi0_libero was trained with openpi's extra delta transform, so its first six
-# action channels are offsets from the state at plan time and every stale chunk
-# must be re-anchored.  Neither pi0.5 checkpoint was: their actions are LIBERO's
-# own, and with zero delta channels the anchor add and the frame correction are
-# no-ops.
 DELTA = 0 if args.model in ("pi05", "lerobot05") else DELTA_DIMS
-# openpi normalises pi0.5 by quantiles; LeRobot's run used MEAN_STD for both.
 QUANT = PI05
-# LeRobot's pi05 preprocessor writes the normalised state into the prompt
-# ("Task: ..., State: <8 bins>;\nAction: "), so its tokens change every step.
 STATE_PROMPT = args.model == "lerobot05"
 TOK = f"{HOME}/assets/paligemma_tokenizer.model"
 POSE = 6
@@ -319,8 +261,6 @@ if args.net:
         sys.exit("--net and --student are two different correctors; pick one")
     from student_net import NetCorrector
     NET = NetCorrector(args.net, model, be, be.H, be.d_a, device="cuda")
-    # the plan's own hidden state, which the plan computes and would otherwise
-    # throw away; only read when the checkpoint was trained to use it
     TAP = {}
     if getattr(NET.net, "plan_dim", 0):
         model.action_out_proj.register_forward_hook(
@@ -329,8 +269,6 @@ if args.net:
 FULL_V, FULL_B = be.L_V, be.L_B
 
 ns = find_norm_stats(RAW)
-# openpi picks the normalisation by model type: z-score for pi0, quantiles for
-# pi0.5 -- and a mismatch still produces plausible-looking actions.
 spec = from_openpi_norm_stats(ns, d_a=D, use_quantiles=QUANT)
 sm, ss = state_spec_from_openpi_norm_stats(ns, d_state=8, use_quantiles=QUANT)
 _lp = LiberoPrompt(TOK, max_len=be.max_token_len)
@@ -338,12 +276,6 @@ _BINS = np.linspace(-1, 1, 256 + 1)[:-1]
 
 
 def state_tokens(text, st8):
-    """LeRobot's pi05 prompt, rebuilt from its processor_pi05 step verbatim.
-
-    The normalised 8-dim state -- not padded, not clipped -- is digitised into
-    256 bins over [-1, 1] and written into the text, which the PaliGemma
-    tokenizer then encodes with BOS and right-pads to 200.
-    """
     cleaned = text.strip().replace("_", " ").replace("\n", " ")
     bins = " ".join(map(str, np.digitize(st8, bins=_BINS) - 1))
     ids = _lp._sp.encode(f"Task: {cleaned}, State: {bins};\nAction: ", add_bos=True)
@@ -351,9 +283,6 @@ def state_tokens(text, st8):
     return torch.tensor(ids + [0] * (be.max_token_len - len(ids)), dtype=torch.int64)
 
 
-# With the state in the prompt, a task's text can only be tokenised together
-# with an observation, so prompt() hands the text through and to_observation
-# does the rest.
 prompt = (lambda text: text) if STATE_PROMPT else _lp
 
 
@@ -387,14 +316,6 @@ def to_observation(raw, tokens, t):
 
 @torch.no_grad()
 def integrate(x0, tau0, n, obs, E_V=None, E_B=None, plan=None, age=None):
-    """Integrate model-time from tau0 down to 0 in n equal Euler steps.
-
-    A call that names no depth is a CORRECTION, so it runs the student when one
-    is loaded and the teacher otherwise.  Callers that need the teacher whatever
-    is loaded -- the reference plans that define SREF and the natural spread --
-    pass the full depth explicitly, because those are the yardstick and must not
-    move when the corrector changes.
-    """
     ev = (S_EV if (E_V is None and S_EV is not None)
           else (FULL_V if E_V is None else E_V))
     eb = (S_EB if (E_B is None and S_EB is not None)
@@ -403,11 +324,7 @@ def integrate(x0, tau0, n, obs, E_V=None, E_B=None, plan=None, age=None):
     x = x0.clone().float().to(be.device)
     tau = tau0.clone().float().to(be.device)
     step = (tau / max(n, 1)).view(-1, 1, 1)
-    # The memory is built once and shared by the K draws, exactly as the trainer
-    # did it -- that sharing is why a correction costs one encoder pass, not K.
     if NET is not None and E_V is None and getattr(NET.net, "plan_dim", 0) and plan is None:
-        # the compile warm-up traces this before any episode has planned; use the
-        # last plan the teacher made, or zeros when none has run yet
         _h = TAP.get("h")
         plan = (_h[0].float() if _h is not None
                 else torch.zeros(NET.net.H, NET.net.plan_dim, device=be.device))
@@ -441,13 +358,6 @@ def hold_pad(A, H):
     return torch.cat([A, A[-1:].expand(H - A.shape[0], A.shape[1])], dim=0)
 
 
-# The gripper is binary in intent -- LIBERO encodes the two modes as +-1 -- but
-# the flow treats it as one more continuous channel.  That asymmetry is the
-# whole hypothesis: for a bimodal channel the conditional mean sits BETWEEN the
-# modes, and "half closed" is a command that grasps nothing.  Averaging two
-# nearby pose trajectories gives a usable trajectory; averaging open and closed
-# gives neither.  These are the two mode locations in the policy's normalised
-# space, which is where the correction actually operates.
 G = spec.grip
 G_LO = float((spec.grip_raw_modes[0] - spec.mean[G]) / spec.scale[G])
 G_HI = float((spec.grip_raw_modes[1] - spec.mean[G]) / spec.scale[G])
@@ -456,23 +366,6 @@ G_HALF = 0.5 * abs(G_HI - G_LO)
 
 
 def grip_stats(A_new, A_stale, m):
-    """How crisp is the corrected gripper, did it change its mind, does it chatter?
-
-    Snapping the gripper to its nearer mode moved success from 92% to 98% while
-    the MEAN distance it had to travel was 2.6% of the half-separation.  A mean
-    that small producing an effect that large means the mean is the wrong
-    statistic, and two different mechanisms fit the evidence equally well:
-
-      tail     a handful of positions -- at the grasp transitions, where it
-               matters -- sit far from either mode, and the average hides them.
-      chatter  the value loiters near the midpoint so the commanded side flips
-               between ADJACENT executed steps, and the gripper never commits.
-
-    So return the per-position ambiguities rather than their mean (percentiles
-    are computed at the end), and count side changes between adjacent positions
-    of the executed segment -- for the corrected chunk and for the stale chunk it
-    came from, since chatter is only evidence if the correction introduced it.
-    """
     g_new, g_old = A_new[:m, G], A_stale[:m, G]
     near = torch.minimum((g_new - G_LO).abs(), (g_new - G_HI).abs())
     side_new, side_old = g_new > G_MID, g_old > G_MID
@@ -498,14 +391,12 @@ def apply_grip_mode(A_new, A_stale):
 
 
 def write_episode_video(frames, ok, language, config, path, scale=2, fps=20):
-    """Agentview frames with a bar showing the action source: orange while a plan's chunk
-    runs, green while a correction's does; the last frames carry the outcome."""
     import cv2
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     h, w = frames[0][0].shape[:2]
     H, W, bar = h * scale, w * scale, 28
     vw = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H + bar))
-    col = {"plan": (0, 140, 255), "correction": (80, 200, 60)}      # BGR
+    col = {"plan": (0, 140, 255), "correction": (80, 200, 60)}
     name = "replan every %d" % args.replan if config == "baseline" else "corrector"
     for i, (f, kind) in enumerate(frames + [frames[-1]] * fps):
         img = cv2.resize(cv2.cvtColor(f, cv2.COLOR_RGB2BGR), (W, H), interpolation=cv2.INTER_NEAREST)
@@ -526,8 +417,8 @@ class LiberoEnv:
         self._t = 0
         self._done = False
         self._anchor = raw_state(t0_raw)
-        self.kind = "plan"                     # source of the chunk now executing
-        self.frames = None                     # [(frame, kind)] when recording
+        self.kind = "plan"
+        self.frames = None
 
     def mark_plan_anchor(self):
         self._anchor = raw_state(self._raw)
@@ -554,12 +445,8 @@ class LiberoEnv:
         return self._done
 
 
-# ==========================================================================
-# the two loops
-# ==========================================================================
 @torch.no_grad()
 def run_baseline(env, gen, T_max):
-    """pi_0 as it ships: full plan, execute args.replan actions, full plan."""
     steps = plans = 0
     while not env.terminated and steps < T_max:
         env.mark_plan_anchor()
@@ -580,9 +467,8 @@ def run_baseline(env, gen, T_max):
 
 @torch.no_grad()
 def run_corrector(env, gen, T_max):
-    """Plan once, then correct.  A full replan happens only on fallback."""
     steps = plans = corrections = fallbacks = 0
-    teacher_fix = teacher_saves = 0   # --cascade: teacher retries, and those that held
+    teacher_fix = teacher_saves = 0
     disp, grip_amb, grip_flip, disagree, n_hist = [], [], [], [], []
     grip_chat, grip_chat_stale = [], []
     real_hist = []
@@ -591,13 +477,11 @@ def run_corrector(env, gen, T_max):
     capped = False
     just_planned = False
     used = 0
-    last_seg = args.c      # how many actions the previous cycle executed
-    real_left = 0          # planned entries still in the chunk, before padding
-    plan_feat = None       # the teacher's state when the live plan was made
-    exhausted = 0          # corrections executed with none left
+    last_seg = args.c
+    real_left = 0
+    plan_feat = None
+    exhausted = 0
 
-    # One cycle before the chunk runs out of planned content.  floor(H/c) is
-    # when it hits zero, so the last cycle with anything real is one earlier.
     auto = max(1, H // max(args.c, 1) - 1) if args.auto_cap else 0
 
     while not env.terminated and steps < T_max:
@@ -616,12 +500,6 @@ def run_corrector(env, gen, T_max):
             just_planned = False
             obs_now = env.observe()
             fc = env.frame_correction()
-            # index 0 must mean "act now", and the six pose channels must be
-            # re-expressed against the state the model is about to condition on
-            # A segment can consume the whole chunk once corrections outlive the
-            # horizon (--lineage > H with c_max = H, reachable on pi05's H = 10,
-            # never on pi0's 50 with c_max 25); the stale guess is then the last
-            # action held, which is what hold_pad does to any tail.
             rest = A[last_seg:]
             A_stale = hold_pad(rest if rest.shape[0] else A[-1:], H)
             A_stale[:, :DELTA] += fc
@@ -632,10 +510,6 @@ def run_corrector(env, gen, T_max):
             out = integrate(x0, torch.full((K,), args.tau0),
                             args.steps, obs_now, plan=plan_feat, age=used).cpu()
             if K > 1:
-                # How far apart the draws land, over the actions about to be
-                # executed.  Same observation, same stale chunk, same tau0 --
-                # only the noise differs, so this is the flow's own spread at
-                # this point and nothing else.
                 dis = statistics.median(
                     [dist(out[i], out[j], min(args.c, args.c_max))
                      for i in range(K) for j in range(i + 1, K)])
@@ -645,15 +519,6 @@ def run_corrector(env, gen, T_max):
             A_new = (out[0] if args.k_reduce == "first"
                      else out.median(dim=0).values).clone()
 
-            # -- how far do the draws agree, position by position?
-            #
-            # Two tests per position, and the second is the one that matters:
-            # the pose spread says whether the arm's path is settled, while the
-            # gripper test says whether the draws agree on opening or closing.
-            # Every distance in this file excludes the gripper -- correctly, for
-            # a continuous metric -- which means every verify signal tried so far
-            # has been blind to the one channel where the failures were measured
-            # to live (snap moved 92% to 98% by touching nothing else).
             n_agree = args.c
             if args.adaptive and K > 1:
                 pose = out[:, :args.c_max, :POSE]
@@ -684,10 +549,6 @@ def run_corrector(env, gen, T_max):
                 exhausted += 1
             real_hist.append(real_left)
 
-            # The displacement is the operator's own output, so this costs
-            # nothing: a correction that has to move the chunk a long way is one
-            # the flow is dragging somewhere else entirely, which is exactly the
-            # case a single Euler step has no business resolving.
             d = dist(A_new, A_stale, min(args.c, args.c_max))
             disp.append(d)
 
@@ -701,19 +562,8 @@ def run_corrector(env, gen, T_max):
                        and since_plan >= args.max_corrections)
                       or (auto > 0 and since_plan >= auto))
 
-            # A cap says "this is the LAST correction before a replan", not
-            # "throw this one away".  Discarding it -- which is what an early
-            # `continue` here did -- pays 39.58 ms for a chunk that is never
-            # executed and then pays for a full plan on top, so c=25 with a cap
-            # of one correction cost 3.90 ms/step instead of the 1.95 the design
-            # intends, and the configuration that was supposed to be tested
-            # never ran.  Execute the correction, then let the next iteration
-            # replan.
             if (too_far and args.cascade and NET is not None and not blind
                     and n_agree >= args.cascade_min):
-                # The student says it is unsure.  Ask the operator whose
-                # certificate already holds up, for one Euler step on the same
-                # draws -- cheaper than the replan this would otherwise cost.
                 out_t = integrate(x0, torch.full((K,), args.tau0), args.steps,
                                   obs_now, E_V=FULL_V, E_B=FULL_B).cpu()
                 teacher_fix += 1
@@ -745,22 +595,14 @@ def run_corrector(env, gen, T_max):
                 A = None
                 continue
 
-            # the corrected chunk is conditioned on o_now, so its deltas are
-            # relative to the CURRENT state -- re-anchor before executing it
             env.mark_plan_anchor()
             A = A_new
             env.kind = "correction"
 
-        # Normally one segment is c actions.  On the cycle that will replan,
-        # --drain lets it absorb whatever planned content is left rather than
-        # stranding it: those actions are already paid for and executing them
-        # costs nothing.
         if args.adaptive:
-            # After a plan there are no draws to read, so take the safe
-            # interval; after a correction, take what the draws agreed on.
             seg = args.c_safe if just_planned else max(args.n_min,
                                                        min(n_agree, args.c_max))
-            capped = used + seg >= (args.lineage or H)   # spent: replan next
+            capped = used + seg >= (args.lineage or H)
         else:
             seg = args.c
             if args.drain and capped:
@@ -774,7 +616,7 @@ def run_corrector(env, gen, T_max):
 
         last_seg = seg
         if capped:
-            A = None          # replan on the next iteration, having used this one
+            A = None
         capped = False
 
     return dict(steps=steps, plans=plans, corrections=corrections,
@@ -786,9 +628,6 @@ def run_corrector(env, gen, T_max):
                 n_hist=n_hist)
 
 
-# ==========================================================================
-# setup
-# ==========================================================================
 suite = benchmark.get_benchmark_dict()[args.suite]()
 n_tasks = suite.n_tasks if args.tasks == 0 else min(args.tasks, suite.n_tasks)
 T_max = MAX_STEPS[args.suite]
@@ -838,16 +677,10 @@ if args.compile != "off":
         model.denoise_step = _eager
         print("  running eager")
     else:
-        with torch.no_grad():                    # trace both shapes used
+        with torch.no_grad():
             integrate(torch.randn(1, H, D), torch.tensor([0.5]), 1, _obs)
             be.plan(_obs, noise=_noise)
 
-# The scale every distance is quoted against: how far two honest full-depth
-# plans from the SAME observation already sit apart.  Estimated over several
-# observations, not one.  The single-observation estimate used earlier swung
-# between 0.45 and 0.64 from run to run, which moved every fallback threshold
-# expressed as a multiple of it -- so the displacement fallback was tested
-# against a yardstick that changed underneath it.
 _scales, _perpos = [], []
 with torch.no_grad():
     for _tid in range(min(4, suite.n_tasks)):
@@ -876,11 +709,7 @@ with torch.no_grad():
         _ev.close()
 NATURAL = statistics.median(_scales)
 
-# Per-POSITION reference spread.  Two honest plans agree closely on the action
-# to take now and drift apart further out, so a single scalar threshold would
-# accept the far end too readily and reject the near end too harshly.  This is
-# the same estimate resolved along the chunk instead of averaged over it.
-_sref = torch.stack(_perpos).median(dim=0).values          # (c_max,)
+_sref = torch.stack(_perpos).median(dim=0).values
 SREF = _sref.clamp(min=1e-6)
 print(f"  per-position spread: h=0 {SREF[0]:.3f}  h=5 {SREF[min(5,len(SREF)-1)]:.3f}"
       f"  h={len(SREF)-1} {SREF[-1]:.3f}")
@@ -895,21 +724,8 @@ _ck = f"{S_EV}-{S_EB}" if args.student else f"{FULL_V}-{FULL_B}"
 if _ck not in LAT:
     sys.exit(f"no measured latency for depth {_ck} in {args.latency_from}")
 L_CORR = LAT[_ck]
-# One velocity evaluation, measured directly at batch 1 (44_/45_): the encoder
-# and prefill are paid once whatever the step count, so extra steps cost only
-# the denoise term.  L_CORR above was timed at batch 4 and so overstates a
-# batch-1 correction by about 4%; it is kept as the base anyway, because every
-# speedup already on record uses it and a silent change of basis would make the
-# numbers incomparable.  The bias is conservative -- it understates the method.
 L_DEN = 2.27
-# Widening the batch costs only the action expert: 37.90 ms at K=1 against
-# 39.28 at K=4 (45_probe_overhead, idle GPU), so about 0.46 ms per extra draw.
-# The K=1 base stays at the batch-4 figure every earlier number used, which
-# overstates the corrector by ~4% -- conservative, and comparable.
 if args.net:
-    # The net does not sit on pi0's depth ladder, so the depth-keyed table does
-    # not describe it.  Its figure was timed the same way: idle GPU, K=4 draws
-    # sharing one memory, eager -- so it is comparable to L_CORR above.
     L_CORR_N = args.net_latency
     _ck = "net"
 else:
@@ -918,9 +734,6 @@ print(f"  cost model (idle-GPU measurements): plan {L_PLAN:.2f} ms, "
       f"correction {L_CORR_N:.2f} ms @ {_ck}"
       + (f" ({args.steps} Euler steps)" if args.steps > 1 else "") + "\n")
 
-# ==========================================================================
-# run
-# ==========================================================================
 results = {}
 for config in args.configs:
     print(f"{'='*74}\n{config.upper()}"
@@ -967,11 +780,6 @@ for config in args.configs:
             if args.video_dir:
                 w.frames = [(np.ascontiguousarray(raw["agentview_image"][::-1, ::-1]), "plan")]
 
-            # Identical across configurations, so the n-th draw of a given
-            # (task, trial) is the same on both sides and episodes the corrector
-            # never diverts contribute nothing to the variance of the
-            # difference.  That is a paired comparison and it is worth far more
-            # than the same number of unpaired episodes.
             gen = torch.Generator().manual_seed(
                 args.seed * 1_000_003 + task_id * 10_007 + trial * 101)
 
@@ -986,12 +794,6 @@ for config in args.configs:
                                     f"{args.video_dir}/{args.suite}_t{task_id}_r{trial}_{config}_"
                                     f"{'success' if ok else 'failure'}.mp4")
             n_ep += 1
-            # Per-episode outcomes, so two configurations can be compared as
-            # PAIRS rather than as two totals.  A 2-episode gap between 147/150
-            # and 145/150 says nothing on its own; the discordant pairs -- how
-            # often one wins where the other loses -- say whether it is a real
-            # difference or the same quality reshuffled by trajectory
-            # divergence.
             per_ep.append(dict(task=task_id, trial=trial, ok=ok))
             real_all.extend(tr["real_hist"])
             dis_all.extend(tr["disagree"])

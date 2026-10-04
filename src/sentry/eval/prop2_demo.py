@@ -1,19 +1,3 @@
-"""Proposition 2, measured rather than cited.
-
-Runs the same episode twice under identical conditions -- same backend, same
-thresholds, same ladder, same seeds -- varying exactly one thing: whether the
-verifier's conditioning is fresh or cached.
-
-An exogenous event ``Z`` displaces the target mid-chunk without touching the
-robot's own dynamics, which is the hypothesis of Proposition 2.  The prediction
-is sharp:
-
-    "No verifier of this form can react to ``Z`` before ``Z`` has changed the
-    robot's dynamics, i.e. before contact has already occurred."
-
-Run: ``python -m sentry.eval.prop2_demo``
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -38,11 +22,6 @@ class Outcome:
     steps: int
     final_distance: float
     reaction_step: Optional[int]
-    """First environment step at which the verifier rejected after ``Z``.
-
-    ``None`` means it never reacted -- Proposition 2's prediction for the
-    cached-context family.
-    """
 
 
 def run_one(
@@ -95,7 +74,7 @@ def run_one(
     )
 
 
-def main() -> None:  # pragma: no cover - reporting
+def main() -> None:
     rig = build_rig()
     print("Conformal calibration (eq. 12)")
     print("  " + rig.calibration.summary().replace("\n", "\n  "))
@@ -103,9 +82,6 @@ def main() -> None:  # pragma: no cover - reporting
 
     event = ExogenousEvent(step=10, displacement=(-0.45, 0.30))
 
-    # The right comparison is not "which verifier does better", but "does Z
-    # change what this verifier does at all".  Proposition 2 says the answer
-    # for the cached-context family is no: I(V; Z) = 0.
     print(f"Response to an exogenous event Z at t={event.step}")
     print("(each verifier compared against ITSELF with and without Z)")
     print()
@@ -132,11 +108,6 @@ def main() -> None:  # pragma: no cover - reporting
             )
         print()
 
-    # SS2.6 states the discriminator: the chunk-length distribution should be
-    # "wide in static phases, short under perturbation".  So the question is
-    # not whether the two runs differ at all -- episode lengths differ for
-    # trivial reasons once the target moves -- but whether Z *shortens* the
-    # realised chunk.
     print("Reading the result: does Z shorten the realised chunk?")
     print("-" * 54)
     print(f"  {'verifier':<26} {'static':>8} {'with Z':>8} {'change':>9}   verdict")
@@ -162,5 +133,5 @@ def main() -> None:  # pragma: no cover - reporting
     )
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     main()

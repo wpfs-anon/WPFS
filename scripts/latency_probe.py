@@ -1,27 +1,7 @@
-"""Plan and correction latency for a converted openpi LIBERO policy.
-
-Writes the table eval_corrector.py reads through --latency-from:
-    {"latency_ms": {"plan-plan": <ms>, "<L_V>-<L_B>": <ms>}}
-plan-plan is one full plan at batch 1 (M Euler steps); the depth key is one
-full-depth velocity call at batch K -- a teacher correction.
-
-Timed the way the loop runs: denoise_step compiled (kept only if the chunk is
-preserved), CUDA-synchronised wall clock over many repetitions on an idle GPU.
-Run it on pi0 too.  Reproducing pi0's recorded 57.81 / 39.58 ms is what makes
-the pi05 figures comparable with every speedup already reported.
-
-    python latency_probe.py --model pi05 --out $CORRECTOR_HOME/ckpt/latency_pi05.json
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 import argparse, json, sys, time
 for p in (f"{HOME}/openpi/src", f"{HOME}/openpi/packages/openpi-client/src",
           f"{HOME}/src", f"{HOME}/scripts"):
@@ -53,8 +33,6 @@ H, D = be.H, be.d_a
 print(f"  {args.model}: pi05={model.pi05}  H={H}  d_a={D}  "
       f"prompt tokens={be.max_token_len}  L_V={be.L_V}  L_B={be.L_B}")
 
-# Cost does not depend on pixel values, but it does depend on sequence length,
-# so the prompt is a real instruction padded exactly as the loop pads it.
 tokens = LiberoPrompt(TOK, max_len=be.max_token_len)(
     "pick up the black bowl between the plate and the ramekin and place it on the plate")
 g = torch.Generator().manual_seed(0)
@@ -82,7 +60,7 @@ tk = torch.full((args.k,), 0.5)
 
 
 def timeit(fn, reps):
-    for _ in range(5):                      # warm-up, and every compiled shape traced
+    for _ in range(5):
         fn()
     torch.cuda.synchronize()
     t0 = time.perf_counter()

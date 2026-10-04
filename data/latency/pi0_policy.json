@@ -1,0 +1,11 @@
+{
+ "model": "pi0",
+ "horizon": 50,
+ "k": 4,
+ "compile": "default",
+ "latency_ms": {
+  "plan-plan": 57.806388,
+  "27-18": 39.580938
+ },
+ "note": "per-call latencies (idle RTX 5090) the paper's pi0 rows were priced with; scripts/latency_probe.py --model pi0 re-measures them"
+}

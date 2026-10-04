@@ -1,17 +1,4 @@
 #!/usr/bin/env python
-"""Download the official pi05-LIBERO checkpoint and convert it to PyTorch.
-
-    python setup/03b_fetch_pi05.py
-
-Two artifacts land under openpi_assets/, beside pi0's:
-
-  pi05_libero/          the released JAX checkpoint (quantile norm stats in assets/).
-  pi05_libero_pytorch/  the converted weights every script loads with --model pi05.
-
-pi05_libero is openpi's `pi05_libero` training config: a 10-action chunk, no delta
-anchor on the pose channels, quantile normalisation.  The conversion uses openpi's own
-examples/convert_jax_model_to_pytorch.py with that config name.
-"""
 import os
 import pathlib
 import subprocess
@@ -25,7 +12,7 @@ sys.path.insert(0, str(HOME / "openpi" / "packages" / "openpi-client" / "src"))
 RAW = HOME / "openpi_assets" / "pi05_libero"
 OUT = HOME / "openpi_assets" / "pi05_libero_pytorch"
 
-from openpi.shared import download                       # noqa: E402
+from openpi.shared import download
 
 if not (RAW / "params").exists():
     print("downloading gs://openpi-assets/checkpoints/pi05_libero")

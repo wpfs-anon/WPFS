@@ -1,15 +1,3 @@
-"""Conformal calibration driver -- equation 12 (SS2.4.4).
-
-Turns a set of :class:`sentry.eval.harness.Sample` into a
-:class:`sentry.core.calibration.CalibrationReport`.
-
-The split matters and is enforced here: ``delta`` is fitted on one half of the
-calibration set and *evaluated* on the other.  Eq. 12's guarantee rests on
-exchangeability between calibration and deployment data, and an in-sample
-false-acceptance rate is optimistic by construction -- reporting only that
-number would quietly convert a distribution-free guarantee into a fitted one.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -40,18 +28,10 @@ def build_records(
     rung: Optional[DepthRung] = None,
     generator: Optional[torch.Generator] = None,
 ) -> list[CalibrationRecord]:
-    """Run the deployed check on each sample and reduce it to a record.
-
-    ``rung`` defaults to the ladder's **first** rung: that is where the cascade
-    starts, so it is the depth at which most acceptance decisions are actually
-    made, and therefore the depth whose statistic should be calibrated.
-    """
     rung = rung or cfg.ladder[0]
     records: list[CalibrationRecord] = []
 
     for s in samples:
-        # Eq. 9 at the deployed depth.  The thresholds are irrelevant here --
-        # harvest() reads the *raw* distances, i.e. eq. 10 at delta = 1.
         R, _, _ = renoise_and_reconstruct(
             backend=backend,
             A_hat=s.A_hat,
@@ -79,22 +59,16 @@ def build_records(
 
 @dataclass(frozen=True)
 class SplitCalibration:
-    """A fitted threshold plus its honest, held-out evaluation."""
 
     thresholds: Thresholds
     fit: CalibrationReport
-    """Report from the fitting half (in-sample; optimistic)."""
     holdout_false_acceptance: float
-    """``P(accept | stale)`` on the held-out half.  **This** is the number to
-    compare against ``alpha``."""
     holdout_live_rejection: float
-    """``P(reject | live)`` held out -- the efficiency, which eq. 12 does not
-    control and which sweeping ``alpha`` trades against success."""
     n_fit_stale: int
     n_holdout_stale: int
     n_holdout_live: int
 
-    def summary(self) -> str:  # pragma: no cover - cosmetic
+    def summary(self) -> str:
         return (
             f"alpha={self.fit.alpha:.3f}  {self.thresholds}\n"
             f"  held-out P(accept|stale) = {self.holdout_false_acceptance:.4f} "
@@ -113,7 +87,6 @@ def calibrate_split(
     fit_fraction: float = 0.5,
     seed: int = 0,
 ) -> SplitCalibration:
-    """Fit ``delta`` on one split and evaluate it on the other."""
     idx = torch.randperm(len(records), generator=torch.Generator().manual_seed(seed))
     cut = int(len(records) * fit_fraction)
     fit_set = [records[int(i)] for i in idx[:cut]]

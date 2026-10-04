@@ -1,34 +1,7 @@
-"""The corrector conditioned on pi0's LANGUAGE-MODEL tokens, not raw SigLIP.
-
-54_ gave the net the vision tower's output and nothing else, so everything the
-Gemma stack computes -- binding the image to the instruction, spatial relations,
-task context -- it had to rediscover from the harvest.  The LoRA student never
-had to: it reads the same tokens after fourteen Gemma layers.  That gap is the
-most likely reason a net with MORE data still lands at rel 0.155 where LoRA
-reaches 0.116, and --gemma-layers closes as much of it as the latency budget
-allows.
-
-Two corrections to 54_ ride along, and they are corrections, not variables:
-
-  * --shard-weight.  Pouring 20k libero_90 observations into a 12k spatial set
-    cut spatial from 34% of training to 20% and cost 5 points in the loop while
-    every val metric improved.  Weighting restores the deployment mix while
-    keeping the extra diversity available.
-
-  * --select-shards.  Choosing the checkpoint on aggregate val rel, when 62% of
-    val was libero_90, selected for competence on tasks nobody evaluates.
-    Selection now reads only the shards that match the evaluation suite.
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 import argparse, hashlib, math, os, sys, time
 for v in ("OMP_NUM_THREADS", "MKL_NUM_THREADS"): os.environ.setdefault(v, "8")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -125,11 +98,17 @@ ap.add_argument("--model", choices=["pi0", "pi05"], default="pi0",
                 help="whose frozen encoder builds the memory cache -- it must be the "
                      "teacher the shards were labelled by and the policy the student "
                      "will be deployed beside.")
+ap.add_argument("--pose", type=int, default=6,
+                help="pose channels; the gripper is the channel right after them.  "
+                     "LIBERO is 6 (+1 gripper); a 5-joint arm is 5 (+1).")
+ap.add_argument("--act", type=int, default=7,
+                help="REAL action dims; the rest of D is padding the loss should "
+                     "not chase.  LIBERO 7, a 5-joint arm with a gripper 6.")
 args = ap.parse_args()
 CONV = {"pi0": f"{HOME}/openpi_assets/pi0_libero_pytorch",
         "pi05": f"{HOME}/openpi_assets/pi05_libero_pytorch"}[args.model]
 
-POSE, CMAX, ACT = 6, 25, 7
+POSE, CMAX, ACT = args.pose, 25, args.act
 dev = "cuda"
 
 paths = [q.strip() for q in args.shard.split(",") if q.strip()]
@@ -168,7 +147,6 @@ SEL = ([int(q) for q in args.select_shards.split(",") if q.strip() != ""]
 print(f"  {len(TRAIN)} train / {len(VAL)} val;  checkpoint selected on shards "
       f"{SEL} -> {', '.join(os.path.basename(paths[i]) for i in SEL)}")
 
-# per-epoch sampling weights
 if args.shard_weight:
     w = [float(q) for q in args.shard_weight.split(",")]
     if len(w) != len(paths):
@@ -181,11 +159,9 @@ print("  epoch mix: " + "  ".join(
     f"{os.path.basename(paths[s])[:18]} {100*w[s]:.0f}% ({len(TR_BY_SHARD[s])} obs)"
     for s in range(len(paths))))
 
-# ------------------------------------------------------------------ cache
 def unjpg(b): return cv2.cvtColor(cv2.imdecode(np.frombuffer(b, np.uint8),
                                                cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
-# pi0 tags are left exactly as they were, so existing caches stay valid
 _tag = hashlib.md5(("|".join(paths) + f"|g{args.gemma_layers}"
                     + ("" if args.model == "pi0" else f"|{args.model}")).encode()).hexdigest()[:8]
 C_MEM = f"{args.cache}_{_tag}_mem.npy"
@@ -205,8 +181,6 @@ def build_cache():
         probe = prefix_tokens(model, be, ims, msk, LG[:1].to(dev), S_DIM, dev, args.gemma_layers)
     T, C = probe.shape[1], probe.shape[2]
     print(f"  memory tokens {T} x {C};  cache {N*T*C*2/1e9:.1f} GB -> {C_MEM}")
-    # built under a temporary name and renamed only once flushed, so a build cut
-    # short (hard lock, kill) is never mistaken for a finished cache on a rerun
     part = C_MEM + ".part"
     f = np.lib.format.open_memmap(part, mode="w+", dtype=np.float16, shape=(N, T, C))
     t0 = time.perf_counter()
@@ -253,9 +227,7 @@ if args.feat_cache:
     print(f"  teacher features: {FEAT.shape}, rms {FEAT_RMS:.3f}")
 if args.build_cache_only: sys.exit(0)
 
-# ------------------------------------------------------------------ model
 class Net(nn.Module):
-    """StudentNet with one memory stream instead of image+language+state."""
 
     def __init__(self):
         super().__init__()
@@ -268,9 +240,6 @@ class Net(nn.Module):
             _hd = torch.load(args.teacher_head, map_location="cpu", weights_only=False)
             self.inner.head_w.copy_(_hd["weight"].float())
             self.inner.head_b.copy_(_hd["bias"].float())
-        # trained, then discarded: it never runs in the loop
-        # LayerNorm first: h is the raw block output, tens of times larger than
-        # the unit-RMS targets, which put 97% of the gradient on this term
         self.feat_head = (nn.Sequential(nn.LayerNorm(args.d_model),
                                         nn.Linear(args.d_model, FEAT_W))
                           if FEAT_W else None)
@@ -286,15 +255,12 @@ class Net(nn.Module):
         return self.inner(x, tau, mem, age)
 
     def forward_feat(self, x, tau, mem, age=None):
-        """velocity and the feature it was read off."""
         if self.inner.feat_dim:
             return self.inner.forward_feat(x, tau, mem, age)
         h = self.inner.hidden(x, tau, mem, age)
         return self.inner.out(h), self.feat_head(h)
 
 
-# The loop executes the leading positions of a chunk and lives or dies on the
-# gripper; a flat mean over positions and padded dimensions trains neither.
 POS_W = torch.linspace(1.0, args.pos_tail, H).view(1, H, 1)
 DIM_W = torch.ones(D)
 DIM_W[POSE] = args.grip_weight
@@ -328,16 +294,10 @@ def mem_of(ids):
 
 
 def age_of(ids, k):
-    """one age per observation, repeated over its k interpolants"""
     return (AGE[ids].to(dev).float().repeat_interleave(k) if USE_AGE else None)
 
 
 def pair_spread(o):
-    """(B, K, C, P) -> (B, C): mean distance between draws at each position.
-
-    The rollout test reads the MEDIAN pairwise distance; the mean is used here
-    because it carries a gradient, and the two agree closely at K=8.
-    """
     d = torch.cdist(o.transpose(1, 2), o.transpose(1, 2))
     K = o.shape[1]
     return d.sum(dim=(-1, -2)) / (K * (K - 1))
@@ -353,12 +313,8 @@ def spread_ratio(o_s, o_t):
 
 @torch.no_grad()
 def validate(n_obs):
-    """rel and spread per shard, because one aggregate hid a 5-point regression."""
     net.eval()
     acc = {s: [0.0, 0.0, 0.0, 0] for s in range(len(paths))}
-    # n_obs counts observations from the SELECTED shards.  A flat prefix of VAL
-    # meant that when libero_90 was 62% of the data the checkpoint was chosen
-    # on about two dozen samples.
     sel_ids = [i for i in VAL if int(SHARD_OF[i]) in SEL][:n_obs]
     oth_ids = [i for i in VAL if int(SHARD_OF[i]) not in SEL][:max(16, n_obs // 4)]
     for i in sel_ids + oth_ids:
@@ -423,8 +379,6 @@ for ep in range(1, args.epochs + 1):
         B_, K = x.shape[0], x.shape[1]
         mem = mem_of(ids)
         if args.mem_noise > 0:
-            # one draw per observation, not per interpolant: at deployment every
-            # interpolant of a correction shares the one memory
             mem = mem + args.mem_noise * mem.pow(2).mean().sqrt() * torch.randn_like(mem)
         mem = mem.repeat_interleave(K, dim=0)
         opt.zero_grad(set_to_none=True)
@@ -443,9 +397,6 @@ for ep in range(1, args.epochs + 1):
             ft = torch.from_numpy(np.stack(
                 [np.asarray(FEAT[i][sel[j]], dtype=np.float32)
                  for j, i in enumerate(ids)])).to(dev)
-            # chained: the frozen head expects the teacher's own scale, so match
-            # raw features and divide the loss instead, to keep the number
-            # comparable with the side-target runs (1.0 = predicting zero)
             if not args.teacher_head:
                 ft = ft / FEAT_RMS
             loss_f = Fn.mse_loss(fpred, ft.reshape(B_ * K, H, FEAT_W))
@@ -458,8 +409,6 @@ for ep in range(1, args.epochs + 1):
             loss_s = Fn.mse_loss(pair_spread(o_s), pair_spread(o_t))
             loss = loss_v + args.lambda_spread * loss_s
         if args.lambda_grip > 0:
-            # the same test the certificate applies to the gripper: do the draws
-            # agree?  pair_spread on one channel is exactly that disagreement
             g_s = (x - TAU0 * pred.reshape(B_, K, H, D))[:, :, :CMAX, POSE:POSE + 1]
             g_t = (x - TAU0 * tgt.reshape(B_, K, H, D))[:, :, :CMAX, POSE:POSE + 1]
             loss_g = Fn.mse_loss(pair_spread(g_s), pair_spread(g_t))

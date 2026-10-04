@@ -1,11 +1,3 @@
-"""Shared construction for the evaluation drivers.
-
-Every driver needs the same four things -- a spec with real normalisation
-statistics, a planner, an oracle backend, and thresholds from conformal
-calibration -- so they are built once here rather than four times, slightly
-differently.
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -29,7 +21,6 @@ __all__ = ["Rig", "build_rig"]
 
 @dataclass
 class Rig:
-    """A calibrated SENTRY instance over the mock environment."""
 
     cfg: SentryConfig
     env_cfg: MockReachConfig
@@ -40,7 +31,6 @@ class Rig:
     oracle_cfg: OracleConfig
 
     def backend(self) -> OracleBackend:
-        """A fresh backend.  Each gets its own RNG so runs stay comparable."""
         return OracleBackend(self.planner, self.oracle_cfg)
 
 
@@ -52,11 +42,9 @@ def build_rig(
     sigma_0: float = 0.5,
     seed: int = 0,
 ) -> Rig:
-    """Fit statistics, build the backend, and calibrate ``delta`` by eq. 12."""
     cfg = cfg or SentryConfig(H=50)
     env_cfg = env_cfg or MockReachConfig(H=cfg.H, max_steps=200)
 
-    # SS2.9 (ii): distances must be computed using the policy's own statistics.
     spec = fit_spec(env_cfg)
     planner = make_planner(env_cfg, spec)
     oracle_cfg = OracleConfig(

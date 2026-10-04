@@ -1,44 +1,7 @@
-"""Distil the corrector into a truncated pi_0 with LoRA.
-
-The corrector is queried at one point of the flow -- model time tau0=0.5, one
-Euler step -- so this is regression on a single time slice, not consistency
-distillation: there are no sampling steps left to remove.
-
-What the floor measurement (48_) says about the problem, and why it shapes the
-design:
-
-    depth 14-12, untrained:   rel L2 1.995   cosine 0.849   draw spread 20.4x
-
-Direction is largely preserved and magnitude is not: solving
-r^2 - 2r*cos + 1 = relL2^2 gives ||v_shallow|| / ||v_teacher|| ~ 2.8, and a single
-scalar rescale would already take rel L2 to sqrt(2 - 2*0.849) = 0.55.  The
-dominant error is therefore a gain on the read-out, exactly the mismatch a
-low-rank update to one projection is shaped to fix.  Everything below is aimed
-at that, with the trunk adapters as the second-order correction.
-
-Two things this file will not let happen quietly:
-
-  * `be.velocity` is decorated `@torch.no_grad()`, so it cannot be trained
-    through.  The forward here is rebuilt from `_prefix` + `denoise_step`, which
-    are not, and is checked against `be.velocity` at startup: if the two disagree
-    the student is being trained on a different function than the one deployed.
-
-  * A student can drive rel L2 down while collapsing the disagreement between
-    draws, which is the quantity the acceptance test reads.  Loss would look
-    perfect and the mechanism would accept everything.  So the draw spread is
-    logged every validation pass, and it has to land near 1.0 -- approached from
-    ABOVE, since truncation starts at 20x.
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 
 
 import argparse
@@ -122,12 +85,9 @@ args = ap.parse_args()
 
 CONV = f"{HOME}/openpi_assets/pi0_libero_pytorch"
 POSE, CMAX = 6, 25
-ACT = 7          # six pose channels plus the gripper; 7..31 are padding
+ACT = 7
 torch.manual_seed(args.seed)
 
-# ==========================================================================
-# data
-# ==========================================================================
 paths = [q.strip() for q in args.shard.split(",") if q.strip()]
 parts = []
 for q in paths:
@@ -142,8 +102,6 @@ for q, d in zip(paths, parts):
     if int(d["k_harvest"]) != int(parts[0]["k_harvest"]):
         sys.exit(f"{q} has k_harvest={d['k_harvest']}, not {parts[0]['k_harvest']}")
 
-# sref is per-shard and per-suite; it is a rollout-time yardstick and is not
-# read during training, so the shards concatenate cleanly without it.
 sh = dict(
     jpg_a=[b for d in parts for b in d["jpg_a"]],
     jpg_w=[b for d in parts for b in d["jpg_w"]],
@@ -180,22 +138,18 @@ def obs_of(i):
 
 
 def batch_of(i, k, gen=None):
-    """k interpolants and their teacher velocities for observation i."""
     kk = sh["x"].shape[1]
     sel = (torch.randperm(kk, generator=gen)[:k] if gen is not None
            else torch.arange(k))
     return sh["x"][i, sel].float(), sh["v"][i, sel].float()
 
 
-# ==========================================================================
-# model
-# ==========================================================================
 model = load_pi0_pytorch(CONV, device="cuda")
 be = OpenPiBackend(model, device="cuda", M=10,
                    E_V_max=args.e_v, E_B_max=args.e_b, n_rungs=1,
                    lora_rank=args.rank, lora_rank_readout=args.rank_readout,
                    lora_dropout=0.0, attach_adapters=True)
-model.eval()                       # no dropout anywhere; adapters are gated
+model.eval()
 set_adapter_slot(model, 0)
 for p in model.parameters():
     p.requires_grad_(False)
@@ -208,13 +162,6 @@ print(f"  adapters at ({args.e_v}, {args.e_b}): {len(params)} tensors, "
 
 
 def _batched_obs(obs_list):
-    """The openpi observation namespace built from B DIFFERENT observations.
-
-    ``be._openpi_obs`` replicates ONE observation across the batch, which is
-    what the K interpolants need and not what several observations need.  This
-    builds the same fields with a genuinely different row per observation, so
-    the encoder and the prefill run once for the whole group.
-    """
     dev = be.device
     ref = obs_list[0].images[0]
     images, masks = {}, {}
@@ -240,12 +187,6 @@ def _batched_obs(obs_list):
 
 
 def _repeat_cache(cache, K):
-    """Give each of the B prefixes K consecutive rows.
-
-    ``_expand_cache`` widens a batch-1 cache; here every observation needs its
-    own K copies, and they must be interleaved so row b*K+j belongs to
-    observation b -- the order the flattened interpolants are stacked in.
-    """
     if K == 1:
         return cache
     for lst in (cache.key_cache, cache.value_cache):
@@ -256,17 +197,10 @@ def _repeat_cache(cache, K):
 
 
 def student_v(x, tau, obs, grad=True):
-    """v at (E_V, E_B) with adapters ON, for one observation.
-
-    Rebuilt from the primitives because ``be.velocity`` is under
-    ``@torch.no_grad()``; checked against it at startup so the training target
-    is the deployed function and not a lookalike.
-    """
     return student_v_batch([obs], x.unsqueeze(0), tau.unsqueeze(0), grad)[0]
 
 
 def student_v_batch(obs_list, x, tau, grad=True):
-    """(B, K, H, D) velocities from B observations in one encoder+prefill pass."""
     from openpi.models_pytorch.pi0_pytorch import make_att_2d_masks
     B, K = x.shape[0], x.shape[1]
     ctx = torch.enable_grad() if grad else torch.no_grad()
@@ -290,8 +224,6 @@ def student_v_batch(obs_list, x, tau, grad=True):
     return v.reshape(B, K, *v.shape[1:])
 
 
-# -- the rebuilt forward must equal the deployed one, adapters off (they are
-#    zero-initialised, so both should be the plain truncated model)
 _o = obs_of(TRAIN[0])
 _x, _ = batch_of(TRAIN[0], 4)
 _t = torch.full((4,), TAU0)
@@ -305,22 +237,6 @@ if _gap > 1e-3:
     sys.exit("the training forward is not the deployed forward -- refusing to "
              "train a student on a different function than the one evaluated")
 
-# Batching changes the compute path, so it gets its own guard -- but the guard
-# has to measure the right thing.  Two checks, because they catch different
-# faults:
-#
-#   independence  the same observation duplicated across the batch must give
-#                 rows that agree EXACTLY.  Any disagreement means the group is
-#                 leaking -- a mask applied to the wrong row, a cache repeated
-#                 in the wrong order -- and the loss would be computed against
-#                 the wrong observation while looking perfectly healthy.
-#
-#   agreement     batched against sequential, in RELATIVE terms.  bf16 changes
-#                 its reduction order with the batch width, so an exact match is
-#                 not on offer: measured at 0.4% between K=1 and K=16, against a
-#                 student error of 13.7%.  A max-abs threshold rejects that
-#                 harmless noise by reading the few largest elements; the
-#                 relative norm is the scale the training objective works in.
 if args.obs_batch > 1:
     _oa, _ob = obs_of(TRAIN[0]), obs_of(TRAIN[1])
     _xa, _ = batch_of(TRAIN[0], 4)
@@ -354,12 +270,6 @@ print(f"  {steps_per_epoch} steps/epoch x {args.epochs} = {total_steps} steps")
 
 
 def spread_ratio(out_s, out_t):
-    """How the K corrected chunks scatter, student against teacher.
-
-    This is what the acceptance test reads.  Below ~0.7 the student has
-    under-dispersed and the test will accept everything; truncation starts far
-    ABOVE 1.0, so training should bring it down toward one and stop there.
-    """
     def med(o):
         K = o.shape[0]
         return torch.stack([torch.linalg.vector_norm(o[a] - o[b], ord=2, dim=-1)
@@ -369,13 +279,6 @@ def spread_ratio(out_s, out_t):
 
 @torch.no_grad()
 def validate(n_obs):
-    """Two rel L2 figures, because they answer different questions.
-
-    ``rel`` covers the seven channels the robot reads and is the honest measure
-    of how well the student corrects.  ``rel32`` covers all thirty-two and is
-    reported only so this run can be compared with the earlier one, which was
-    trained and scored unmasked -- its 0.093 is the diluted number.
-    """
     num = den = cos = spr = 0.0
     num32 = den32 = 0.0
     for i in VAL[:n_obs]:

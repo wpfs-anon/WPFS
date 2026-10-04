@@ -1,0 +1,12 @@
+{
+ "model": "pi0",
+ "sim_threshold": 0.996,
+ "static_top_k": 150,
+ "task_top_k": 100,
+ "attn_layer": 8,
+ "max_age": 1,
+ "compile": "default",
+ "L_plan": 57.729593600015505,
+ "L_plan_vlacache": 47.629656350181904,
+ "note": "per-plan latencies in ms measured on an idle RTX 5090; read by baselines/libero/*_eval.py --latency-from"
+}

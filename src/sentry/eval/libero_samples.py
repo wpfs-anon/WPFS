@@ -1,27 +1,3 @@
-"""Build SS3.5.2 samples from real LIBERO demonstrations.
-
-This is the SS3.5.2 datagen recipe run against a real corpus instead of the mock
-environment, and it follows the same five steps: sample a plan anchor ``t``, run
-the frozen full-depth model on ``o_t`` to get ``A_t``, sample ``k ~ U{0..H-1}``,
-build ``A_hat`` by eq. 7 with the deployed padding, then choose ``o*`` by sample
-type.
-
-**Three of the four negative generators work on demonstrations alone.**  N2
-(plan--observation mismatch) pairs the chunk with an observation from a
-different index of the same episode; N3 (cross-task) takes one from a different
-episode; N4 (injected corruption) edits the candidate and leaves the observation
-alone.  Only **N1** -- re-rendering the scene with a task-relevant object
-displaced -- needs the simulator, so it is absent here and D1 is reported
-without it.  That is a real gap for the headline experiment, where N1 is the
-generator closest to the exogenous events Proposition 2 is about; it is not a
-gap for the D1 gate, which asks whether truncation error is small next to
-staleness signal.
-
-The shared noise draw of paper defect **D5** is threaded through: one ``A^0`` per
-anchor, reused for the fresh plan the liveness label is computed against, so
-eq. 5 compares two plans that differ only in their observation.
-"""
-
 from __future__ import annotations
 
 import dataclasses
@@ -45,27 +21,10 @@ from sentry.eval.harness import Sample, SampleKind
 
 __all__ = ["LiberoSampleBuilder", "phase_of", "calibrate_eps_and_relabel"]
 
-# Generators that a demonstration corpus can supply unaided.  N1 is deliberately
-# absent -- see the module docstring.
 DEMO_NEGATIVES: tuple[SampleKind, ...] = ("N2", "N3", "N4")
 
 
 def phase_of(episode: LiberoEpisode, t: int) -> str:
-    """A coarse manipulation phase, read off the demonstration's gripper channel.
-
-    SS3.10 asks for the D1 curve "broken down by manipulation phase", and SS3.10
-    also predicts where the method should struggle: "a plan that is stale for a
-    reason that is not visible at the truncated depth -- a small occluded
-    displacement, a slipping grasp -- will be accepted... fine alignment is where
-    that is expected to bite."
-
-    LIBERO encodes the gripper in action channel 6 as ``+-1``, so the transitions
-    of that channel segment an episode without any privileged simulator state:
-    before the first close the robot is reaching, while closed it is
-    transporting, and after it reopens it is retreating.  This is a proxy, not
-    ground truth -- it says nothing about *fine alignment* specifically, which
-    would need contact information the demonstration does not record.
-    """
     grip = episode.actions[:, 6]
     closed = (grip > 0).nonzero(as_tuple=False)
     if closed.numel() == 0:
@@ -80,7 +39,6 @@ def phase_of(episode: LiberoEpisode, t: int) -> str:
 
 
 class LiberoSampleBuilder:
-    """Turns demonstration episodes into :class:`Sample` tuples."""
 
     def __init__(
         self,
@@ -102,11 +60,9 @@ class LiberoSampleBuilder:
         self.state_mean = state_mean
         self.state_scale = state_scale
         self.j_min = j_min
-        """``|j| > j_min`` for N2 -- far enough that the scene has genuinely moved."""
         self.n4_offset = n4_offset
         self._tokens: dict[int, Tensor] = {}
 
-    # ------------------------------------------------------------------
 
     def _obs(self, ep: LiberoEpisode, t: int) -> Observation:
         if ep.index not in self._tokens:
@@ -123,13 +79,6 @@ class LiberoSampleBuilder:
         kinds: Sequence[SampleKind] = ("positive", *DEMO_NEGATIVES),
         seed: int = 0,
     ) -> list[Sample]:
-        """Draw ``n`` samples, cycling through ``kinds``.
-
-        Half positive and half negative is what SS3.5.2 asks for in a *training*
-        batch; here the mix is whatever ``kinds`` says, because D1 wants both
-        classes present in usable numbers for the AUC rather than a particular
-        ratio.
-        """
         H = self.cfg.H
         out: list[Sample] = []
 
@@ -139,8 +88,6 @@ class LiberoSampleBuilder:
             if len(ep) < 4:
                 continue
 
-            # Step 1: a plan anchor, and the shared A^0 behind every plan drawn
-            # for this sample (defect D5).
             t = rng.randrange(0, max(1, len(ep) - 1))
             noise = torch.randn(
                 (H, self.spec.d_a), generator=torch.Generator().manual_seed(seed + i)
@@ -148,7 +95,6 @@ class LiberoSampleBuilder:
             obs_t = self._obs(ep, t)
             A = self.backend.plan(obs_t, noise=noise)
 
-            # Step 2: elapsed count and the eq. 7 candidate.
             k = rng.randrange(0, H)
             A_hat, H_k = repad(
                 live_suffix=A[k:H].cpu(),
@@ -158,13 +104,11 @@ class LiberoSampleBuilder:
                 learned_pad=None,
             )
 
-            # Step 3: the check observation, by sample type.
             h0: Optional[int] = None
             if kind == "positive":
                 t_star = min(t + k, len(ep) - 1)
                 obs_star = self._obs(ep, t_star)
             elif kind == "N2":
-                # Same episode, an index far enough away that the scene moved.
                 lo, hi = 0, len(ep) - 1
                 choices = [
                     u for u in range(lo, hi + 1) if abs(u - (t + k)) > self.j_min
@@ -183,8 +127,6 @@ class LiberoSampleBuilder:
                     continue
                 obs_star = self._obs(other, rng.randrange(len(other)))
             elif kind == "N4":
-                # Corruption is applied to the candidate; the observation is the
-                # honest one, which is what makes h0 a ground-truth length.
                 t_star = min(t + k, len(ep) - 1)
                 obs_star = self._obs(ep, t_star)
                 if H_k < 2:
@@ -198,17 +140,12 @@ class LiberoSampleBuilder:
             else:
                 raise ValueError(f"unsupported sample kind {kind!r}")
 
-            # Step 4: the liveness label, from a fresh full-depth replan under
-            # the SAME noise.  Definition 1 is stated against "the plan the
-            # target itself would produce from the current observation".
             fresh = self.backend.plan(obs_star, noise=noise).cpu()
 
             is_live, first = liveness(
                 fresh, A_hat, H_k, eps=self.cfg.liveness_eps, m=self.cfg.liveness_m
             )
 
-            # SS3.5.2's h* rule, in one place: H_k for positives, h0 for N4,
-            # and a full-depth evaluation of eq. 5 otherwise.
             if kind == "positive":
                 h_star = H_k
             elif kind == "N4":
@@ -238,20 +175,6 @@ def calibrate_eps_and_relabel(
     cfg: SentryConfig,
     quantile: float = 0.9,
 ) -> tuple[float, list[Sample]]:
-    """Choose Definition 1's ``epsilon`` from these samples, then relabel them.
-
-    Two passes over the same set, because ``epsilon`` is not knowable in advance:
-    the builder labels with whatever ``cfg.liveness_eps`` holds, and those labels
-    are then discarded in favour of ones computed against a tolerance measured
-    from the positive population (see
-    :func:`sentry.core.calibration.calibrate_liveness_eps`).
-
-    ``h_star`` is recomputed with the label, since for N2/N3 it comes from the
-    same evaluation of eq. 5; positives keep ``H_k`` and N4 keeps ``h0``, which
-    are fixed by construction and do not depend on the tolerance.
-
-    Returns ``(epsilon, relabelled)``.
-    """
     pos = [
         liveness_distance(s.fresh_plan, s.A_hat, m=cfg.liveness_m)
         for s in samples

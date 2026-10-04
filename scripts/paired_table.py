@@ -1,15 +1,4 @@
 #!/usr/bin/env python
-"""Paired comparison of evaluation runs against the baseline, one suite at a time.
-
-    python scripts/paired_table.py results/pi05/libero_10 r5 r10 teacher_L50 student
-
-Each name is a JSON written by eval_corrector.py (`<dir>/<name>_s7.json`).  The first
-is the reference (a baseline run).  Every other row shows its success rate, its speedup
-(reference ms/step over its ms/step), and the discordant pairs against the reference --
-episodes only the reference solves / episodes only this row solves -- with the exact-
-continuity McNemar p-value.  All runs must cover the same (task, trial) episodes, which
-they do when they share --seed: every episode draws its noise from (seed, task, trial).
-"""
 import json, math, sys
 
 def load(path):

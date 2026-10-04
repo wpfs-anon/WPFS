@@ -1,5 +1,3 @@
-"""Algorithm 1: liveness (Proposition 5), freshness (Corollary 3), and D4."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -20,11 +18,6 @@ from sentry.core.types import (
 )
 
 
-# --------------------------------------------------------------------------
-# Doubles
-# --------------------------------------------------------------------------
-
-
 def spec() -> ChannelSpec:
     return ChannelSpec(
         d_a=7, pos=(0, 1, 2), rot=(3, 4, 5), grip=6,
@@ -34,11 +27,9 @@ def spec() -> ChannelSpec:
 
 @dataclass
 class CountingEnv:
-    """A trivial environment that just counts steps."""
 
     max_steps: int = 40
     stale_by: int = 0
-    """Report an observation this many steps behind -- for the freshness test."""
 
     def __post_init__(self):
         self._t = 0
@@ -78,7 +69,7 @@ class StubBackend:
         self.plans += 1
         return torch.zeros(self.H, self.d_a)
 
-    def velocity(self, A_tau, tau, obs, E_V, E_B, adapters):  # pragma: no cover
+    def velocity(self, A_tau, tau, obs, E_V, E_B, adapters):
         return torch.zeros_like(A_tau)
 
 
@@ -108,20 +99,7 @@ def go(env, verifier, c=None, T_max=40, backend=None):
     )
 
 
-# --------------------------------------------------------------------------
-# Proposition 5 -- liveness
-# --------------------------------------------------------------------------
-
-
 def test_always_reject_still_makes_progress():
-    """The adversarial case Proposition 5 is really about.
-
-    "every iteration of the speculative loop either advances t by N >= 1 or
-    exits ... Hence no infinite sequence of iterations leaves t fixed."  With a
-    verifier that never accepts, all progress comes from the unconditional
-    commit -- which is why ``m_min >= 1`` is a liveness requirement rather than
-    a tuning choice.
-    """
     env = CountingEnv(max_steps=40)
     backend, trace = go(env, lambda A, H_k, o: verdict(0, H_k))
 
@@ -132,8 +110,6 @@ def test_always_reject_still_makes_progress():
 
 
 def test_target_invocation_bound_holds():
-    """"on an episode of length T_max the target is invoked at most
-    ceil(T_max / m_min) times"."""
     for m_min in (1, 2, 4, 7):
         env = CountingEnv(max_steps=60)
         _, trace = go(env, lambda A, H_k, o: verdict(0, H_k), cfg(m_min=m_min), T_max=60)
@@ -141,21 +117,14 @@ def test_target_invocation_bound_holds():
 
 
 def test_accepting_verifier_needs_far_fewer_target_calls():
-    """The whole point: a plan that keeps being endorsed keeps being executed."""
     env = CountingEnv(max_steps=40)
     _, trace = go(env, lambda A, H_k, o: verdict(H_k, H_k))
-    # Each round: commit 4, then accept the remaining 6 -> chunk of 10.
     assert trace.chunk_lengths == [10, 10, 10, 10]
     assert trace.target_invocations == 4
     assert trace.rho == 0.0
 
 
 def test_commit_is_unconditional():
-    """The verifier is not consulted until after ``m_min`` actions have run.
-
-    "those actions were produced by the target from the current observation, so
-    verifying them against the target's own plan would be vacuous."
-    """
     seen: list[int] = []
 
     def verifier(A_hat, H_k, obs):
@@ -168,18 +137,6 @@ def test_commit_is_unconditional():
 
 
 def test_plan_exhaustion_is_not_counted_as_rejection():
-    """``rho`` in eq. 18 is "the fraction of checks that end in rejection".
-
-    A plan that runs to ``k >= H`` ends the speculative phase without any check
-    having rejected, so it must not inflate ``rho``.
-
-    ``T_max`` is 24 rather than a multiple of ``H`` on purpose: at ``T_max=20``
-    the second round reaches ``steps == T_max`` on the very action that also
-    exhausts the plan, and the loop's budget guard fires first -- so that round
-    ends on the step budget, not on exhaustion, and only one exhaustion is
-    counted.  That is correct behaviour, but it makes the test measure a
-    coincidence instead of the property.
-    """
     env = CountingEnv(max_steps=40)
     _, trace = go(env, lambda A, H_k, o: verdict(H_k, H_k), T_max=24)
     assert trace.rejections == 0
@@ -188,34 +145,19 @@ def test_plan_exhaustion_is_not_counted_as_rejection():
     assert trace.chunk_lengths == [10, 10, 4]
 
 
-# --------------------------------------------------------------------------
-# Corollary 3 -- the verifier must see the present
-# --------------------------------------------------------------------------
-
-
 def test_stale_observation_is_rejected_loudly():
-    """A stale ``o`` would silently reduce SENTRY to the Proposition 2 straw man.
-
-    The symptom -- slightly better speedup, slightly worse success -- reads as
-    a tuning problem rather than a correctness one, which is exactly why this
-    is an assertion and not a comment.
-    """
     env = CountingEnv(max_steps=20, stale_by=3)
     with pytest.raises(StaleObservationError, match="fresh exteroceptive input"):
         go(env, lambda A, H_k, o: verdict(1, H_k), T_max=20)
 
 
 def test_observation_is_re_read_at_every_check():
-    """Algorithm 1 line 12 writes ``o_t``, but the loop must re-observe."""
     env = CountingEnv(max_steps=20)
     _, trace = go(env, lambda A, H_k, o: verdict(1, H_k), T_max=20)
-    # One observation per replan plus one per check, all distinct reads.
     assert len(env.observations) == trace.target_invocations + trace.checks
 
 
 def test_backend_may_not_expose_a_cache():
-    """SS2.9: reusing plan-mode KV in check mode "is a correctness error, not
-    an optimisation"."""
 
     class Leaky(StubBackend):
         def velocity(self, A_tau, tau, obs, E_V, E_B, adapters, kv_cache=None):
@@ -226,13 +168,7 @@ def test_backend_may_not_expose_a_cache():
         assert_no_cache_seam(Leaky())
 
 
-# --------------------------------------------------------------------------
-# Ablation axes -- all disabled by default
-# --------------------------------------------------------------------------
-
-
 def test_no_timer_by_default():
-    """SS2.6: "Algorithm 1 contains no timer.""" ""
     env = CountingEnv(max_steps=40)
     _, trace = go(env, lambda A, H_k, o: verdict(1, H_k), T_max=40)
     assert trace.forced_refreshes == 0
@@ -258,13 +194,6 @@ def test_mu_warn_records_prefetch_opportunities():
 
 
 def test_max_accept_bounds_the_blindness_horizon():
-    """Paper defect D4.
-
-    Algorithm 1 line 21 executes the whole accepted prefix open-loop, so ``N``
-    is simultaneously the reactivity horizon: an exogenous event landing inside
-    an accepted prefix is invisible until the prefix ends.  Capping ``N`` makes
-    that latency an explicit, bounded quantity.
-    """
     env = CountingEnv(max_steps=40)
     _, uncapped = go(env, lambda A, H_k, o: verdict(H_k, H_k), T_max=40)
 
@@ -273,7 +202,7 @@ def test_max_accept_bounds_the_blindness_horizon():
 
     assert max(uncapped.accepted_prefixes) == 6
     assert max(capped.accepted_prefixes) == 2
-    assert capped.checks > uncapped.checks   # reactivity is bought with checks
+    assert capped.checks > uncapped.checks
 
 
 def test_on_replan_fires_once_per_target_invocation():
@@ -288,22 +217,16 @@ def test_on_replan_fires_once_per_target_invocation():
     assert len(seen) == trace.target_invocations == backend.plans
 
 
-# --------------------------------------------------------------------------
-# Trace accounting (equation 18 inputs)
-# --------------------------------------------------------------------------
-
-
 def test_trace_reports_eq18_inputs():
     env = CountingEnv(max_steps=40)
     _, trace = go(env, lambda A, H_k, o: verdict(3, H_k), T_max=40)
     assert trace.rho == pytest.approx(0.0)
     assert trace.N_bar == pytest.approx(3.0)
     assert trace.J_bar == pytest.approx(1.0)
-    assert trace.gain_ratio == float("inf")     # rho == 0
+    assert trace.gain_ratio == float("inf")
 
 
 def test_gain_ratio_is_finite_when_rejections_occur():
-    """``rho^-1 N_bar`` -- "where the gain must appear" (SS2.7)."""
     calls = {"n": 0}
 
     def alternating(A_hat, H_k, obs):

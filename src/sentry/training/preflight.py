@@ -1,20 +1,3 @@
-"""Pre-flight checks -- run these before committing a GPU to a long run.
-
-Every check here targets a failure that is **silent**: training proceeds, the
-loss goes down, and the resulting adapters are wrong.  A loss curve cannot tell
-you that Stage B quietly re-tuned ``Delta_V``, that the teacher branch was
-never detached, that ``tau`` was drawn from ``U(0,1)`` instead of the deployed
-schedule, or that resume dropped the optimiser moments.  You find out days
-later, from a verifier that accepts everything.
-
-The checks run on CPU in about a minute, against
-:class:`sentry.models.toy_pi0.TinyPi0`.  They test the **training machinery**,
-not pi_0 -- but the machinery is what breaks, and it breaks identically at both
-scales.
-
-Run: ``python -m sentry.training.preflight``
-"""
-
 from __future__ import annotations
 
 import copy
@@ -52,16 +35,9 @@ class Result:
     detail: str
     seconds: float = 0.0
     advisory: bool = False
-    """Advisory checks report a number to judge, not a pass/fail invariant."""
-
-
-# --------------------------------------------------------------------------
-# Fixtures
-# --------------------------------------------------------------------------
 
 
 def _rig(H: int = 8):
-    """A small but structurally faithful setup: two experts, shared attention."""
     torch.manual_seed(0)
     env_cfg = MockReachConfig(H=H, img_size=16, max_steps=60)
     spec = fit_spec(env_cfg, n=64)
@@ -84,17 +60,7 @@ def _stage_b(model, cfg, spec, steps=50):
     return StageBTrainer(model, cfg, StageBConfig(E_V=3, total_steps=steps, lr=3e-3), spec)
 
 
-# --------------------------------------------------------------------------
-# Checks
-# --------------------------------------------------------------------------
-
-
 def check_adapter_partition() -> Result:
-    """``Delta_V`` and ``Delta_B`` must be disjoint and cover every adapter.
-
-    An adapter in neither group is trained by no stage and stays at its zero
-    initialisation -- inert, and invisible unless you count tensors.
-    """
     model, *_ = _rig()
     g = split_adapters(model)
     ids_V = {id(p) for p in g.params_V()}
@@ -110,12 +76,6 @@ def check_adapter_partition() -> Result:
 
 
 def check_stage_a_gradients() -> Result:
-    """Stage A trains ``Delta_V``.  "Nothing else." (SS2.5.1)
-
-    Two warm-up steps first: LoRA starts with ``B = 0``, so ``dL/dA`` is
-    exactly zero on the first backward and the audit would read every
-    ``lora_A`` as idle for reasons that have nothing to do with wiring.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_a(model, cfg)
     batch = make_stage_a_batch(model, cfg, spec, 2, env_cfg, random.Random(0))
@@ -130,12 +90,6 @@ def check_stage_a_gradients() -> Result:
 
 
 def check_stage_b_gradients() -> Result:
-    """Stage B trains ``Delta_B`` + read-out; ``Delta_V`` is frozen (SS2.5.2).
-
-    The leak this is really watching for is ``Delta_V`` picking up gradient:
-    Stage B silently re-tuning the encoder undoes the perception warm-start
-    Stage A spent 20k steps on, and the loss curve says nothing about it.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_b(model, cfg, spec)
     batch = make_stage_b_batch(
@@ -146,8 +100,6 @@ def check_stage_b_gradients() -> Result:
         tr.step(batch, rng)
 
     tr.opt.zero_grad(set_to_none=True)
-    # Audit at the deepest rung of the curriculum, where the most adapters are
-    # active; shallower draws legitimately leave the upper layers idle.
     loss, _ = tr.loss_on(batch, rng, torch.Generator().manual_seed(0), E_B=model.L_B)
     loss.backward()
     rep = audit(model, "Stage B", tr.groups.delta_B)
@@ -155,7 +107,6 @@ def check_stage_b_gradients() -> Result:
 
 
 def check_theta_never_moves() -> Result:
-    """``theta`` is frozen throughout -- Proposition 4 depends on it."""
     model, cfg, spec, env_cfg = _rig()
     before = {n: p.detach().clone() for n, p in model.named_parameters() if ".lora_" not in n}
 
@@ -173,12 +124,6 @@ def check_theta_never_moves() -> Result:
 
 
 def check_prop4_after_training() -> Result:
-    """After training, gating adapters off must be **bit-identical** again.
-
-    Proposition 4 is claimed "for any ``Delta`` obtained by the training of
-    Sec. 2.5", so it has to survive an actual optimiser step, not merely hold
-    at initialisation where ``B`` is still zero.
-    """
     model, cfg, spec, env_cfg = _rig()
     o = make_stage_a_batch(model, cfg, spec, 1, env_cfg, random.Random(0)).obs[0]
     A = torch.randn(1, model.H, model.d_a)
@@ -201,11 +146,6 @@ def check_prop4_after_training() -> Result:
 
 
 def check_teacher_detached() -> Result:
-    """The teacher sits under ``sg[.]``, so it must carry no graph.
-
-    Beyond correctness this is roughly half the activation memory -- on a 16 GB
-    T4 it decides whether pi_0 fits at all.
-    """
     model, cfg, spec, env_cfg = _rig()
     o = make_stage_a_batch(model, cfg, spec, 1, env_cfg, random.Random(0)).obs[0]
     A_tau = torch.randn(1, model.H, model.d_a)
@@ -224,11 +164,6 @@ def check_teacher_detached() -> Result:
 
 
 def check_tau_from_deployed_schedule() -> Result:
-    """Stage B draws ``tau ~ T``, "not ``U(0,1)``" (SS2.5.2 step 4).
-
-    The shallow mode is only ever queried at the timesteps in ``T``; training
-    it across the whole path spends capacity where it will never be asked.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_b(model, cfg, spec)
     batch = make_stage_b_batch(
@@ -261,13 +196,6 @@ def check_tau_from_deployed_schedule() -> Result:
 
 
 def check_depth_curriculum() -> Result:
-    """``E_B ~ p_depth`` must actually vary (SS2.5.2, *Depth curriculum*).
-
-    "A single ``Delta_B`` then serves a *range* of depths, which is what makes
-    the depth cascade of Sec. 2.6 possible without training one adapter per
-    depth."  A curriculum stuck on one depth trains an adapter that only works
-    at that rung, and the cascade silently degrades.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_b(model, cfg, spec)
     rng = random.Random(0)
@@ -283,13 +211,6 @@ def check_depth_curriculum() -> Result:
 
 
 def check_margin_loss_edges() -> Result:
-    """Equation 15's two unstated edge cases.
-
-    ``h_star == H_k``: "The second term is omitted" -- there is no invalid
-    position, and including it would train the model to reject the padded tail
-    that eq. 11 never evaluates.  ``h_star == 0``: the sum is empty and
-    ``1/h_star`` would divide by zero.
-    """
     d_good = torch.full((6,), 0.1)
     fully_live = margin_loss(d_good, h_star=6, H_k=6, m=0.2)
 
@@ -308,18 +229,11 @@ def check_margin_loss_edges() -> Result:
 
 
 def check_anti_collapse_fires() -> Result:
-    """Equation 16 must penalise the degenerate optimum it exists to exclude.
-
-    "A degenerate optimum of equation 14 alone is a shallow mode that ignores
-    ``o*`` and reproduces ``A_hat`` by copying the interpolant, which yields
-    ``d_h ~ 0`` everywhere and a verifier that accepts unconditionally."
-    """
     eta = 0.05
     collapsed = torch.randn(4, 8, 7)
     penalty_collapsed = sensitivity_loss(collapsed, collapsed.clone(), eta)
     penalty_healthy = sensitivity_loss(collapsed, collapsed + 5.0, eta)
 
-    # Tolerance, not equality: eta round-trips through float32.
     ok = abs(float(penalty_collapsed) - eta) < 1e-6 and float(penalty_healthy) == 0.0
     return Result(
         "eq. 16 penalises an observation-ignoring verifier",
@@ -330,7 +244,6 @@ def check_anti_collapse_fires() -> Result:
 
 
 def check_finite_and_deterministic() -> Result:
-    """No NaN/Inf, and the same seed reproduces the same loss."""
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_b(model, cfg, spec)
     batch = make_stage_b_batch(
@@ -347,11 +260,6 @@ def check_finite_and_deterministic() -> Result:
 
 
 def check_overfit_single_batch() -> Result:
-    """The single most informative smoke test for any training loop.
-
-    If the loss will not fall on one batch held fixed, no amount of data or
-    GPU-hours will help -- something is disconnected.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_a(model, cfg, steps=60)
     batch = make_stage_a_batch(model, cfg, spec, 2, env_cfg, random.Random(0))
@@ -372,21 +280,6 @@ def check_overfit_single_batch() -> Result:
 
 
 def check_plan_is_deterministic_under_shared_noise() -> Result:
-    """``plan(obs, noise)`` must be a function of ``(obs, noise)`` alone.
-
-    **Paper defect D5.**  Definition 1 writes ``pi_theta(o_{t+k})`` as though it
-    were a value, but a flow-matching policy returns a *sample* from a
-    multi-modal distribution -- the reason the target is a diffusion policy at
-    all.  Comparing two independent draws makes eq. 5 measure the policy's own
-    sampling spread rather than staleness, and that label is the foundation of
-    both eq. 12's calibration and eq. 15's ``h_star``.
-
-    On this untrained model the spread is ~4.0 per position against
-    ``liveness_eps = 0.05``, i.e. two hundred thousand times the tolerance it is
-    compared against -- which is how every sample in a Stage-B batch came to be
-    labelled stale at position 0.  The fix is a common random number, and this
-    asserts the backend honours it.
-    """
     model, cfg, spec, env_cfg = _rig()
     batch = make_stage_a_batch(model, cfg, spec, 1, env_cfg, random.Random(0))
     obs = batch.obs[0]
@@ -405,34 +298,6 @@ def check_plan_is_deterministic_under_shared_noise() -> Result:
 
 
 def check_liveness_labels_are_informative() -> Result:
-    """``h_star`` must not be degenerate across a Stage-B batch.
-
-    This is the check that would have caught D5.  Seventeen other checks passed
-    while every sample in the batch carried ``h_star = 0`` -- they all verified
-    *machinery* (gradients reach the right tensors, the teacher is detached,
-    ``tau`` comes from the deployed schedule) and none verified that the labels
-    those mechanisms consume mean anything.
-
-    Three invariants, all from SS2.5.2, stated per generator rather than in
-    aggregate:
-
-    - **positives satisfy ``h_star == H_k``.**  A positive is one whose scene
-      "has evolved only through the robot's own execution of the plan", so it is
-      live by construction and has no invalid position to push up.  Any other
-      value hands eq. 15 a push-up target on a live plan, putting it in direct
-      opposition to eq. 14.  This is the invariant D5 was breaking.
-    - **N4 satisfies ``h_star >= 1``.**  Its corruption starts at ``h_0`` drawn
-      from ``{1, ..., H_k-1}``, and the prefix before it is untouched -- so a
-      zero here means the ``h_0`` it supplies by construction is being
-      overwritten by something else.
-    - **the batch carries more than one distinct ``h_star``.**  The degenerate
-      case that actually occurred was *every* label at 0.
-
-    Deliberately **not** asserted: that N1/N3 give ``h_star > 0``.  A displaced
-    or swapped target invalidates the plan from the very first action, so
-    ``h_star = 0`` is the *correct* label there, and demanding otherwise would
-    be demanding the label be wrong.
-    """
     model, cfg, spec, env_cfg = _rig()
     batch = make_stage_b_batch(
         model, cfg, spec, 8, SampleGenConfig(env=env_cfg, min_H_k=3), random.Random(0)
@@ -460,26 +325,6 @@ def check_liveness_labels_are_informative() -> Result:
 
 
 def check_negative_generators_are_all_present() -> Result:
-    """A Stage-B batch must be able to produce all four of N1-N4.
-
-    SS2.5.2: negatives are "drawn uniformly from four generators".  The recipe
-    was implemented correctly in :mod:`sentry.eval.harness` and then
-    reimplemented -- N1 only -- in :mod:`sentry.training.datagen`, so Stage B
-    trained on a quarter of it for as long as that lasted.  What was lost was
-    specific: N4 is "the only generator that supplies a supervised target for
-    the accepted *length* rather than for the binary label", and it is the only
-    source of ``h_star`` that does not route through ``liveness`` -- hence the
-    only one immune to D5.
-
-    Drawn over a batch large enough that all four are near-certain, then
-    asserted rather than assumed.
-
-    ``j_min`` is lowered from its default of 5 for this fixture.  N2 pairs the
-    candidate with an observation ``j`` steps away, ``|j| > j_min``, and needs
-    ``0 <= k + j < H``; at the toy's ``H = 8`` the default leaves almost no
-    admissible ``(k, j)``, so N2 would be missing for a reason that is about the
-    fixture rather than about the generator.  The default suits ``H = 50``.
-    """
     model, cfg, spec, env_cfg = _rig()
     batch = make_stage_b_batch(
         model, cfg, spec, 24,
@@ -497,15 +342,6 @@ def check_negative_generators_are_all_present() -> Result:
 
 
 def check_stage_b_distillation_can_converge() -> Result:
-    """Can ``L_dist`` fall at all, with the competing terms switched off?
-
-    Stage A had an overfit check from the start and Stage B did not, which is
-    how a non-converging ``L_dist`` went unnoticed.  This isolates the
-    machinery: with ``lambda_m = lambda_s = 0`` the objective is exactly
-    equation 14, and if the shallow mode cannot be pulled onto the full-depth
-    teacher on a single fixed batch at a fixed depth, something is wired wrong.
-    Weighting is judged separately, by the advisory check below.
-    """
     model, cfg, spec, env_cfg = _rig()
     cfg = cfg.with_(lambda_m=0.0, lambda_s=0.0)
     tr = _stage_b(model, cfg, spec, steps=150)
@@ -532,35 +368,6 @@ def check_stage_b_distillation_can_converge() -> Result:
 
 
 def check_margin_target_is_reachable() -> Result:
-    """Does the **full-depth teacher** satisfy equation 15's hinge?
-
-    Equation 14 pulls the student onto the teacher; equation 15 reshapes a
-    thresholded functional of the student's reconstruction.  If the teacher's
-    own ``L_marg`` is large, the two are asking for different things and
-    ``lambda_m * L_marg`` will fight ``L_dist`` -- the student is being told to
-    outperform the very target it is being distilled from.
-
-    Advisory, because the honest reading depends on the checkpoint.  On an
-    untrained model the velocity field is meaningless, so the teacher may fail
-    the hinge for reasons that say nothing about a real policy.  **Run this
-    against pi_0** before trusting Table 2's ``lambda_m = 1.0``: a teacher that
-    passes its own hinge makes the two terms compatible, and a teacher that
-    does not makes them rivals.
-
-    History worth keeping, because it changes how to read a ``RIVALS`` verdict.
-    This check was written after ``L_dist`` was observed not to converge, and it
-    reported ``RIVALS`` -- which was taken as evidence that eq. 14 and eq. 15 are
-    structurally opposed.  They are not.  The teacher was failing a hinge posed
-    against ``h_star = 0`` on **every** sample, positives included, because the
-    liveness label was comparing two independent draws of a stochastic policy
-    (paper defect D5, see
-    :func:`check_plan_is_deterministic_under_shared_noise`).  With the label
-    fixed the hinge is posed against the right position.  So: if this reports
-    ``RIVALS``, check
-    :func:`check_liveness_labels_are_informative` **first** -- a bad label
-    produces the same symptom as a genuine conflict, and only one of the two is
-    a finding.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_b(model, cfg, spec)
     batch = make_stage_b_batch(
@@ -599,11 +406,6 @@ def check_margin_target_is_reachable() -> Result:
 
 
 def check_checkpoint_roundtrip() -> Result:
-    """Save and load must restore adapters **and** optimiser state.
-
-    Dropping AdamW's moments is the classic silent resume bug: the loss keeps
-    falling, so nothing looks wrong, while the optimiser restarts its warm-up.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_a(model, cfg)
     batch = make_stage_a_batch(model, cfg, spec, 2, env_cfg, random.Random(0))
@@ -635,11 +437,6 @@ def check_checkpoint_roundtrip() -> Result:
 
 
 def check_resume_equivalence() -> Result:
-    """An interrupted-and-resumed run must equal the uninterrupted one.
-
-    This is the property Colab will exercise for you whether or not you test
-    it.  Ten steps straight through, versus five, checkpoint, five more.
-    """
     def run(interrupt: bool):
         model, cfg, spec, env_cfg = _rig()
         tr = _stage_a(model, cfg)
@@ -663,20 +460,13 @@ def check_resume_equivalence() -> Result:
 
 
 def check_throughput() -> Result:
-    """Project Table 2's 20k / 60k steps onto measured step time.
-
-    Advisory: the number is for this toy model on CPU and says nothing about
-    pi_0 on a GPU.  What it *does* tell you is the shape of the arithmetic --
-    at 20k + 60k steps, a step time of 0.5 s is 11 hours, which is already past
-    a Colab session cap and means resume must work before you start.
-    """
     model, cfg, spec, env_cfg = _rig()
     tr = _stage_b(model, cfg, spec)
     batch = make_stage_b_batch(
         model, cfg, spec, 2, SampleGenConfig(env=env_cfg, min_H_k=3), random.Random(0)
     )
     rng = random.Random(0)
-    tr.step(batch, rng)                                   # warm-up
+    tr.step(batch, rng)
     t0 = time.perf_counter()
     n = 5
     for _ in range(n):
@@ -706,7 +496,6 @@ CHECKS: tuple[Callable[[], Result], ...] = (
     check_anti_collapse_fires,
     check_finite_and_deterministic,
     check_overfit_single_batch,
-    # -- the data the objectives consume, before the objectives themselves --
     check_plan_is_deterministic_under_shared_noise,
     check_liveness_labels_are_informative,
     check_negative_generators_are_all_present,
@@ -724,7 +513,7 @@ def run_all(verbose: bool = True) -> list[Result]:
         t0 = time.perf_counter()
         try:
             r = fn()
-        except Exception as exc:  # a check that crashes is a failure, not a stop
+        except Exception as exc:
             r = Result(fn.__name__, False, f"raised {type(exc).__name__}: {exc}")
         r.seconds = time.perf_counter() - t0
         results.append(r)
@@ -735,7 +524,7 @@ def run_all(verbose: bool = True) -> list[Result]:
     return results
 
 
-def main() -> int:  # pragma: no cover - reporting
+def main() -> int:
     print("SENTRY training pre-flight")
     print("=" * 78)
     results = run_all()
@@ -761,5 +550,5 @@ def main() -> int:  # pragma: no cover - reporting
     return 0
 
 
-if __name__ == "__main__":  # pragma: no cover
+if __name__ == "__main__":
     raise SystemExit(main())

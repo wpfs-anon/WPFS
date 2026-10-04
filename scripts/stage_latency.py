@@ -1,46 +1,7 @@
-"""Where does the time in a plan and in a correction actually go?
-
-Every speedup quoted so far rested on a split of L into encoder, prefill and
-denoise that was never measured in this line of work -- it was obtained by
-subtracting a batch-4 velocity call from a batch-1 plan and dividing by nine.
-That is not a measurement: the two calls run the action expert at different
-batch sizes, so their difference is 10*d(b=1) - d(b=4), which is one equation in
-two unknowns.  The derived d came out 2.03 ms against the 1.50 ms that 28_'s
-own docstring reports from direct instrumentation, a 35% error, and it happened
-to fall on the flattering side.
-
-So measure the three stages directly, by timing the three primitives both paths
-share:
-
-    pwe.embed_image                 the vision encoder, once per camera
-    pwe.forward with no KV cache    the prefix prefill
-    model.denoise_step              one velocity evaluation
-
-denoise_step internally calls pwe.forward *with* a cache; that call is excluded
-so the prefill is not counted twice.  This is the same instrumentation 28_ uses,
-which is what makes the numbers comparable to the ones already in the record.
-
-Three questions, all of which change the ceiling:
-
-  1. What is L_enc, L_pre, L_den at batch 1, on this GPU, compiled?
-  2. How much does batch inflate the denoise step?  If d(b=4) >> d(b=1), every
-     latency in gate_depth_s7.json is charging the corrector for interpolants a
-     deployed loop never evaluates.
-  3. How many images does the encoder actually run on?  LIBERO supplies two
-     cameras.  If the checkpoint pads to three, a third of the encoder and a
-     quarter of the prefill tokens are white pixels, and deleting them is a
-     free speedup that needs no research at all.
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 
 
 import argparse
@@ -67,13 +28,6 @@ import torch
 
 torch.set_num_threads(4)
 
-# Each batch size the corrector is timed at is a separate compiled graph, and
-# so is the planner's.  The default recompile limit is 8; blowing it makes
-# dynamo silently fall back to eager PART WAY THROUGH the sweep, which is how
-# the first attempt reported one denoise step at 38 ms in the correction row
-# and 7 ms in the plan row -- same batch, same op, five times apart.  A wrong
-# number that looks plausible is worse than a crash, so raise the limit and
-# assert afterwards that the two agree.
 torch._dynamo.config.cache_size_limit = 64
 if hasattr(torch._dynamo.config, "recompile_limit"):
     torch._dynamo.config.recompile_limit = 64
@@ -137,13 +91,6 @@ def to_observation(raw, tokens, t):
 
 
 class StageProfiler:
-    """Charge encoder, prefill and denoise separately, wherever called from.
-
-    A plan makes one encode, one prefill and M denoise calls; a correction makes
-    one encode, one prefill and ONE denoise call.  Timing the three primitives
-    rather than the two entry points is what makes that asymmetry visible
-    instead of buried inside a single number.
-    """
 
     def __init__(self, backend, model):
         self.pwe, self.model = backend._pwe, model
@@ -160,7 +107,7 @@ class StageProfiler:
 
         def fwd(*a, **k):
             if k.get("past_key_values", None) is not None:
-                return self._fwd(*a, **k)          # inside denoise, not a prefill
+                return self._fwd(*a, **k)
             torch.cuda.synchronize(); t = time.perf_counter()
             out = self._fwd(*a, **k)
             torch.cuda.synchronize(); self.pre += time.perf_counter() - t
@@ -216,8 +163,6 @@ if args.compile != "off":
         model.denoise_step = _eager
         print("  eager")
 
-# trace every batch before the profiler is attached, or the first call at each
-# shape pays its compilation inside the timed region
 with torch.no_grad():
     for K in BATCHES:
         be.velocity(A_tau=torch.randn(K, H, D), tau=torch.full((K,), 0.5),
@@ -261,10 +206,6 @@ for r in rows:
 
 plan, corr1 = rows[0], rows[1]
 
-# Cross-check: one denoise step at batch 1 is the same operation whether it was
-# reached through the planner or through a single correction.  If these two
-# disagree, something recompiled inside a timed region and every number in the
-# table is suspect.
 d_plan = plan["den"] / max(plan["n_den"], 1)
 d_corr = corr1["den"] / max(corr1["n_den"], 1)
 skew = max(d_plan, d_corr) / max(min(d_plan, d_corr), 1e-9)

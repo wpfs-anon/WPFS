@@ -1,8 +1,4 @@
 #!/usr/bin/env python
-"""Confirm the tree is complete and pi0 loads, before anything long runs.
-
-    python setup/04_check.py
-"""
 import os
 import pathlib
 import sys

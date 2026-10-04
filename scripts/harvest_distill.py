@@ -1,38 +1,7 @@
-"""Harvest (observation, interpolant, teacher velocity) for distilling the corrector.
-
-The corrector is queried at exactly ONE point of the flow -- model time tau0=0.5,
-one Euler step, on an interpolant built from the chunk already in hand.  So the
-student does not have to learn a velocity field over all of time; it has to
-match v_theta on a single slice, on the inputs the deployed loop actually visits.
-That makes this plain regression, not consistency distillation: there are no
-steps left to remove, since the corrector already spends one.
-
-Where the samples come from matters more than how many there are.  They are
-harvested from rollouts of the WORKING mechanism (adaptive, tau=1.0, cap 25), so
-the observations are the ones a corrector meets in deployment and the stale
-chunks carry the compounding history a synthetic sampler would not reproduce.
-
-Cost trick: the prefix is 35 ms of the 37.9 and is shared across a batch, so one
-observation yields K_harvest interpolants for about 5 ms more.  Sixteen draws per
-correction turns ~290 corrections per sweep into ~4600 training pairs.
-
-What the student must preserve, and what a plain L2 fit can silently destroy:
-the acceptance test reads the DISAGREEMENT between K draws.  Those draws differ
-only because their x differs -- v_theta itself is deterministic -- so a student
-that matches v pointwise reproduces the spread, while one that is merely smooth
-under-disperses and makes the test accept everything.  That is why the eval
-checks the N distribution and not just the loss.
-"""
-
-# --- repository layout -------------------------------------------------
-# Every path hangs off one root so the tree can live anywhere.  Set
-# CORRECTOR_HOME to override; by default it is the directory holding this
-# scripts/ folder, which is what setup/ populates.
 import os as _os
 HOME = _os.environ.get(
     "CORRECTOR_HOME",
     _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-# -----------------------------------------------------------------------
 
 import argparse
 import io
@@ -128,9 +97,6 @@ CONV, RAW = {
              f"{HOME}/openpi_assets/pi05_libero"),
 }[args.model]
 PI05 = args.model == "pi05"
-# pi0_libero's first six action channels are offsets from the state at plan
-# time (openpi's extra delta transform); pi05_libero's are LIBERO's own actions,
-# and with zero delta channels the anchor add and frame correction are no-ops.
 DELTA = 0 if PI05 else DELTA_DIMS
 TOK = f"{HOME}/assets/paligemma_tokenizer.model"
 
@@ -274,8 +240,6 @@ def make_env(tid, trial):
     bddl = os.path.join(get_libero_path("bddl_files"), t.problem_folder, t.bddl_file)
     e = OffScreenRenderEnv(bddl_file_name=bddl, camera_heights=RES, camera_widths=RES)
     if args.random_scenes:
-        # A scene no evaluation runs: the task's own placement sampler under
-        # this episode's seed (same seed, same scene -- checked before use).
         e.seed(args.scene_seed + 1000 * tid + trial)
         raw = e.reset()
     else:
@@ -339,9 +303,6 @@ SREF = torch.stack(_perpos).median(dim=0).values.clamp(min=1e-6)
 _e.close()
 print(f"  per-position spread h=0 {SREF[0]:.3f}  h={len(SREF)-1} {SREF[-1]:.3f}")
 
-# ==========================================================================
-# harvest
-# ==========================================================================
 buf = dict(jpg_a=[], jpg_w=[], state=[], lang=[], x=[], v=[], tau=[], meta=[])
 n_pairs = 0
 t0 = time.time()
@@ -361,13 +322,10 @@ for tid in range(n_tasks):
             else:
                 just_planned = False
                 obs_now, fc = w.observe(), w.frame_correction()
-                # a segment can use the whole chunk once corrections outlive the
-                # horizon (lineage > H); the stale guess is then the last action held
                 rest = A[last_seg:]
                 A_stale = hold_pad(rest if rest.shape[0] else A[-1:], H)
                 A_stale[:, :DELTA] += fc
 
-                # -- the training pairs: many interpolants, one prefix
                 eh = torch.randn(args.k_harvest, H, D, generator=gen)
                 xh = args.tau0 * eh + (1.0 - args.tau0) * A_stale.unsqueeze(0)
                 tauh = torch.full((args.k_harvest,), args.tau0)
@@ -384,10 +342,6 @@ for tid in range(n_tasks):
                 buf["meta"].append((tid, trial, steps))
                 n_pairs += args.k_harvest
 
-                # -- the deployed mechanism decides what happens next; the first
-                #    k_draws interpolants double as its draws, so no extra cost.
-                #    Under --net the student makes that decision, so the states and
-                #    stale chunks stored from here on are the ones it produces.
                 if NET is not None:
                     vk = NET.velocity(xh[:K], tauh[:K], NET.memory(obs_now)).float()
                 else:

@@ -1,31 +1,3 @@
-"""Device placement, tested without a GPU.
-
-Three device bugs reached Colab before these existed, and each was invisible
-locally because this machine is CPU-only: everything defaults to the same
-device, so a missing ``device=`` is indistinguishable from a correct one.
-
-``torch.device("meta")`` closes that gap.  Meta tensors carry shape and device
-but no storage, and PyTorch still enforces device agreement across an
-operation -- so a tensor allocated on the default device while the weights are
-on ``meta`` raises exactly the error a CUDA run would, on a machine with no
-accelerator at all:
-
-    RuntimeError: Tensor on device meta is not on the expected device cpu!
-
-The bugs these lock down:
-
-1. ``TinyPi0.plan`` allocated ``A`` and ``tau`` with no ``device=``, so
-   generating a batch failed the moment the model was moved.
-2. ``_timestep_embedding`` built ``freqs`` on the default device.
-3. The Stage A/B batch builders rendered observations on CPU and handed them
-   straight to ``backend.plan``.
-
-Meta does not cover everything.  Stage-B generation simulates the trajectory
-forward and therefore needs real values, and a meta tensor cannot be read
-back out; that path is exercised on CPU and only its transfer is checked
-against a moved device.
-"""
-
 from __future__ import annotations
 
 import random
@@ -60,9 +32,6 @@ def _obs(cfg: TinyPi0Config, device) -> Observation:
     )
 
 
-# -- the model ---------------------------------------------------------------
-
-
 def test_device_property_follows_the_weights():
     model = _model()
     assert model.device.type == "cpu"
@@ -70,13 +39,6 @@ def test_device_property_follows_the_weights():
 
 
 def test_plan_allocates_noise_on_the_models_device():
-    """The bug that broke the Colab run.
-
-    ``plan`` integrates from ``A^0 ~ N(0, I)``; allocating that noise on the
-    default device works perfectly until the model is moved, and then fails
-    several frames deep inside data generation rather than at the line that is
-    wrong.
-    """
     model = _model().to(META)
     A = model.plan(_obs(model.cfg, META))
     assert A.device.type == "meta"
@@ -92,7 +54,6 @@ def test_velocity_runs_entirely_off_the_default_device():
 
 
 def test_timestep_embedding_follows_tau():
-    """``freqs`` must be built on ``tau``'s device, not the default one."""
     from sentry.models.toy_pi0 import _timestep_embedding
 
     emb = _timestep_embedding(torch.tensor([0.5], device=META), 16)
@@ -100,18 +61,11 @@ def test_timestep_embedding_follows_tau():
 
 
 def test_mismatched_input_is_still_an_error():
-    """Guard the guard: confirm meta really does enforce device agreement.
-
-    If this ever stops raising, the tests above would pass vacuously.
-    """
     model = _model().to(META)
-    A_tau = torch.randn(1, model.H, model.d_a)          # default device
+    A_tau = torch.randn(1, model.H, model.d_a)
     tau = torch.tensor([0.5])
     with pytest.raises(RuntimeError, match="device"):
         model.velocity(A_tau, tau, _obs(model.cfg, META), model.L_V, model.L_B, False)
-
-
-# -- batch generation --------------------------------------------------------
 
 
 def _rig():
@@ -123,11 +77,6 @@ def _rig():
 
 
 def test_stage_a_batch_places_observations_before_planning():
-    """The observation must move *before* ``backend.plan`` sees it.
-
-    Moving the assembled batch afterwards is too late -- the plan call inside
-    generation would already have fed default-device images to moved weights.
-    """
     env_cfg, spec, cfg = _rig()
     model = _model().to(META)
     batch = make_stage_a_batch(
@@ -139,15 +88,6 @@ def test_stage_a_batch_places_observations_before_planning():
 
 
 def test_stage_b_batch_moves_both_halves_of_the_matched_pair():
-    """Equation 16 needs ``o*_+`` and ``o*_-``; both must land on the device.
-
-    Tested through ``StageBBatch.to`` rather than through generation.  Stage-B
-    generation simulates the trajectory forward to find ``ee_k``, which needs
-    real numbers -- a meta tensor cannot be read back out at all
-    (``NotImplementedError: Cannot copy out of meta tensor``).  So the
-    generation path is exercised on CPU below and only the transfer is checked
-    against a moved device.
-    """
     env_cfg, spec, cfg = _rig()
     model = _model()
     batch = make_stage_b_batch(
@@ -161,7 +101,6 @@ def test_stage_b_batch_moves_both_halves_of_the_matched_pair():
 
 
 def test_stage_b_generation_honours_an_explicit_device():
-    """The ``device=`` path itself, on CPU where generation can actually run."""
     env_cfg, spec, cfg = _rig()
     model = _model()
     batch = make_stage_b_batch(
@@ -173,12 +112,6 @@ def test_stage_b_generation_honours_an_explicit_device():
 
 
 def test_batch_index_tensors_stay_on_cpu():
-    """``H_k`` and ``h_star`` are read with ``int()``, so they belong on CPU.
-
-    Shipping them to the accelerator would force a synchronising transfer per
-    element of every batch, for integers the loss functions immediately turn
-    back into Python ints.
-    """
     env_cfg, spec, cfg = _rig()
     model = _model()
     batch = make_stage_b_batch(
@@ -188,20 +121,7 @@ def test_batch_index_tensors_stay_on_cpu():
     assert batch.h_star.device.type == "cpu"
 
 
-# -- seeded sampling ---------------------------------------------------------
-
-
 def test_cpu_generator_with_a_moved_tensor():
-    """A CPU ``Generator`` cannot drive an allocation on another device.
-
-    On CUDA, ``torch.randn(shape, generator=cpu_gen, device="cuda")`` raises
-    "Expected a 'cuda' device type for generator".  Meta does not reproduce
-    that -- it has no storage to fill, so it ignores the generator entirely --
-    and this test does not pretend otherwise.  What it does check is that the
-    helpers take the cross-device branch and still deliver the reference
-    device and dtype, which is what makes a seeded run give the same draw
-    wherever the model lives.
-    """
     g = torch.Generator().manual_seed(0)
     assert g.device.type == "cpu"
     ref = torch.zeros(4, device=META)

@@ -1,8 +1,4 @@
 #!/bin/bash
-# Per-suite students for Spatial, Object and Goal: st_r8 fine-tuned on that suite's two rounds
-# (pc, st_r2 driving; pd, st_r8 driving) in equal parts, at lr 3e-4 for 20 epochs.  lr 3e-4 ends
-# at a similar validation error to lr 1e-4 but evaluates better (Spatial 99.0 vs 98.4, Goal 98.8
-# vs 98.0) -- select the rate on evaluation, not on validation error.
 source "$(dirname "$0")/common.sh"
 lat_table
 for s in libero_spatial libero_object libero_goal; do

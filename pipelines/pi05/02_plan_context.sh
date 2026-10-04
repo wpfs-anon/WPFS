@@ -1,9 +1,4 @@
 #!/bin/bash
-# The student that reaches the teacher.  st_r2 drives a new harvest that also stores, for every
-# correction, the teacher's plan-time hidden state (10 tokens, 1024 wide, computed by the plan and
-# otherwise thrown away) and the plan's age (actions executed since it was made).  st_r8 reads
-# both: --use-plan adds the plan tokens to its memory, --use-age embeds the age.  --mem-noise
-# 0.05 jitters the memory by what a JPEG round trip of the frames really does.
 source "$(dirname "$0")/common.sh"
 HARG="--model pi05 --tasks 10 --trials 60 --random-scenes --scene-seed 700000 --seed 701 --c-max 10 --c-safe 5 --lineage 50"
 for s in $SUITES; do

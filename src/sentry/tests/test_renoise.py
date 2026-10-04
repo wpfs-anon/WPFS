@@ -1,5 +1,3 @@
-"""Equations 8 and 9 -- the cheapest tripwire for a tau-direction slip."""
-
 from __future__ import annotations
 
 import pytest
@@ -18,16 +16,6 @@ def fixture():
 
 
 def test_eq9_is_exact_under_constant_velocity(fixture):
-    """``R^tau`` recovers ``A_hat`` exactly when ``v = A - eps``.
-
-    With ``A^s = s*A + (1-s)*eps`` and a constant field ``v = A - eps``::
-
-        A^s + (1-s)v = sA + (1-s)eps + (1-s)(A - eps) = A
-
-    This holds for *every* tau, which is why SS2.4.2 can say "any point on that
-    path is an admissible query".  A sign or direction error in either equation
-    breaks it immediately.
-    """
     A_hat, eps, s = fixture
     A_s = interpolate(A_hat, s, eps)
     v = (A_hat - eps).unsqueeze(0).expand(len(s), -1, -1)
@@ -38,13 +26,6 @@ def test_eq9_is_exact_under_constant_velocity(fixture):
 
 
 def test_eq9_exact_under_reversed_convention(fixture):
-    """SS2.9 (i): a backend integrating the other way needs *two* corrections.
-
-    Its time argument becomes ``1 - s``, and since its velocity is
-    ``dA/dtau_model`` with ``tau_model = 1 - s``, the chain rule flips the sign
-    of ``dA/ds`` as well.  Getting only the time argument right leaves the
-    reconstruction wrong by ``2(1-s)v`` -- and still plausible-looking.
-    """
     A_hat, eps, s = fixture
     A_s = interpolate(A_hat, s, eps)
     v_model = -(A_hat - eps).unsqueeze(0).expand(len(s), -1, -1)
@@ -55,7 +36,6 @@ def test_eq9_exact_under_reversed_convention(fixture):
 
 
 def test_reversed_convention_is_not_a_no_op(fixture):
-    """Guard against the two corrections silently cancelling."""
     A_hat, eps, s = fixture
     A_s = interpolate(A_hat, s, eps)
     v = (A_hat - eps).unsqueeze(0).expand(len(s), -1, -1)
@@ -72,7 +52,6 @@ def test_to_model_time():
 
 
 def test_interpolation_endpoints(fixture):
-    """``s -> 1`` approaches clean data; ``s -> 0`` approaches pure noise."""
     A_hat, eps, _ = fixture
     near_one = interpolate(A_hat, torch.tensor([0.999]), eps)[0]
     near_zero = interpolate(A_hat, torch.tensor([0.001]), eps)[0]
@@ -81,16 +60,8 @@ def test_interpolation_endpoints(fixture):
 
 
 def test_single_shared_noise_draw(fixture):
-    """SS2.4.2 draws one ``eps`` for the whole of ``T``.
-
-    Sharing it means the K queries differ only in *where they sit on the same
-    noise-to-data line*, which is what makes eq. 11's ``min`` over ``T`` a
-    conservative reading of one situation rather than an average over K
-    unrelated ones.
-    """
     A_hat, eps, s = fixture
     A_s = interpolate(A_hat, s, eps)
-    # Every row must be an affine blend of the *same* two endpoints.
     for i, si in enumerate(s):
         torch.testing.assert_close(A_s[i], si * A_hat + (1 - si) * eps)
 

@@ -1,8 +1,4 @@
 #!/bin/bash
-# LIBERO-Long.  The same fine-tune (st_long, here at lr 1e-4 for 30 epochs) scores 93.0 against the
-# base's 94.0, and its losses concentrate on tasks 5 and 7 (the two white-mug-to-plate tasks).  So
-# st_long drives one more DAgger round on fresh scenes -- 60 a task, 120 on tasks 5 and 7 -- and
-# st_r8 is fine-tuned on all three Long rounds, every observation equally likely.
 source "$(dirname "$0")/common.sh"
 lat_table
 S=libero_10

@@ -4,7 +4,7 @@ All commands assume the repository root as the working directory and
 `.venv/bin/python` as the interpreter. Add `JAX_PLATFORMS=cpu` to keep JAX off
 the GPU.
 
-## π0.5 on LIBERO (all four suites)
+## π0.5
 
 `pipelines/pi05/common.sh` holds every path and default; each stage below is a
 thin script over the four programs in `scripts/`. Timings are for one RTX 5090.
@@ -62,96 +62,60 @@ $PY scripts/eval_corrector.py --model pi05 --latency-from $L --suite libero_10 -
     --task-ids 9 --trial-ids 6 --video-dir videos/mine --out /tmp/clip.json
 ```
 
-## π0 on LIBERO-Spatial
+## π0
 
-
-All commands assume the repository root as the working directory and
-`.venv/bin/python` as the interpreter. Add `JAX_PLATFORMS=cpu` to keep JAX off
-the GPU.
-
-### The four evaluation rows
-
-Every run reports **both** the π₀ baseline and the corrector over the same
-episodes; the printed comparison at the end is the paired one.
+`pipelines/pi0/common.sh` holds the paths and the corrector flags; the per-call latencies the paper's
+π0 rows were priced with are in `data/latency/pi0_policy.json`
+(`scripts/latency_probe.py --model pi0` re-measures them on your GPU, `LAT=... ` overrides).
 
 ```bash
-PY=.venv/bin/python
-COMMON="--adaptive --k-draws 4 --tau0 0.5 --grip snap \
-        --n-min 5 --c-max 25 --c-safe 10 --agree-tau 1.0"
-
-# teacher, full depth                      98.0% @ 1.63x
-$PY scripts/eval_corrector.py $COMMON --seed 7 --out ckpt/teacher_s7.json
-
-# LoRA student                             96.4% @ 2.05x
-$PY scripts/eval_corrector.py $COMMON --seed 7 \
-    --student checkpoints/final30_14-12.pt --out ckpt/lora_s7.json
-
-# network student, lambda = 1              97.71% @ 3.12x
-$PY scripts/eval_corrector.py $COMMON --seed 7 \
-    --net checkpoints/spnet_g0.pt --out ckpt/spnet_s7.json
+bash pipelines/pi0/eval.sh                 # all suites; or name some: bash pipelines/pi0/eval.sh libero_10
 ```
 
-The reported table uses seeds `7 17 27 37 47 57 67` for the baseline and network
-rows, `7 17 27 37 47` for LoRA, and `7 17 27` for the teacher. Each seed is 100
-episodes: 10 tasks × 10 trials of LIBERO-Spatial.
-
-Seeds 7 and up are **evaluation seeds** and were never harvested. The
-distillation data comes from seeds 101 and 102.
-
-## Aggregating and testing
-
-`results/` already holds the per-seed JSON, each with per-episode outcomes.
-Pooling them and running McNemar over the discordant pairs is what produced
-`b = 15, c = 25, p = 0.155`. Do not compare two success rates directly — the
-episodes are paired, and the unpaired difference throws that away.
-
-## Rebuilding the students
-
-Harvest first. Roughly 26 minutes per shard on a 5090; the four shards behind
-the released students are `libero_spatial` seeds 101 and 102, `libero_goal` 101
-and `libero_object` 101, plus `libero_90` seed 101 at 3 trials.
+per suite, 10 tasks x 50 initial states, seed 7:
 
 ```bash
-$PY scripts/harvest_distill.py --suite libero_spatial --seed 101 \
-    --tasks 10 --trials 10 --out distill/spatial
+CORR="--configs corrector --adaptive --k-draws 4 --tau0 0.5 --grip snap --n-min 5 --c-safe 10 --agree-tau 1.0"
+$PY scripts/eval_corrector.py --model pi0 --latency-from data/latency/pi0_policy.json --suite $S --seed 7 \
+    --trials 50 --configs baseline --replan 10 --out ckpt/pi0/$S/base_s7.json
+$PY scripts/eval_corrector.py --model pi0 --latency-from data/latency/pi0_policy.json --suite $S --seed 7 \
+    --trials 50 $CORR --c-max 25 --out ckpt/pi0/$S/teacher_s7.json          # --c-max 10 on libero_object
 ```
 
-Then either student. Both write a checkpoint whenever validation improves, so a
-crash leaves a usable file.
+WPFS-Small adds `--net <student> --net-latency <ms>`: the student is a 27.8M-parameter network
+whose memory is the SigLIP tokens of both cameras plus the instruction embedding (no
+language-model layer); `pipelines/pi0/eval.sh` reads it from `checkpoints/pi0/student.pt` (or
+`NET=...`), and `scripts/latency_probe.py --model pi0 --net <student>` measures its latency.
 
-```bash
-# network student, the reported one -- about 2 hours on a 5090
-$PY scripts/train_net_student.py \
-  --shard distill/train_s101.pt,distill/libero_goal_s101.pt,\
-distill/libero_spatial_s102.pt,distill/libero_object_s101.pt,distill/libero_90_s101.pt \
-  --gemma-layers 0 --lambda-spread 1.0 \
-  --select-shards 0,1,2,3 --val-obs 128 \
-  --epochs 120 --val-every 4000 --out distill/spnet
+## Baselines
 
-# the lambda = 0 ablation: same command, --lambda-spread 0
-```
+`baselines/libero/run.sh <pi0|pi05> [sp vc ev aac]` runs the four accelerators at the operating
+points of the tables (selection rule: the highest success rate among configurations faster than
+the policy):
 
-`--select-shards` decides the checkpoint on the suites that are actually
-evaluated. Choosing on the aggregate instead, when one suite dominates the data,
-selects for competence on tasks nobody measures — that mistake cost 5 points
-once and is why the flag exists. `--val-obs` counts observations **from the
-selected shards**, so it does not silently shrink when they are a minority.
+| method | π0 | π0.5 |
+|---|---|---|
+| SpecPrune-VLA | `--alpha 2.0 --global-from expert --capture-every 1` | same |
+| VLA-Cache | `--max-age 1` | same |
+| EfficientVLA | action-expert cache only: `--n-prune 0 --k-final 512 --cache-interval 3` | same |
+| AAC | `--n 5 --move-th 10` (the published N = 20, alpha = 3 costs 0.41x) | `--n 5 --move-th 5.0` |
+
+On π0 each method's plan latency comes from an idle-GPU measurement (`data/latency/pi0_*.json`);
+on π0.5 it is measured in the method's own session. `baselines/libero/table_pi0.py` and
+`table_pi05.py` print the tables from the runs in `ckpt/pi0` and `ckpt/pi05`. AAC needs the authors' decision code:
+`bash setup/09_baselines.sh`. The DB-OFT baselines are in `docs/REPRODUCE_DBOFT.md`.
 
 ## Figures
 
 ```bash
-# per-stage latency
+$PY scripts/staleness_probe.py --model pi0 --suite libero_spatial --tasks 4 --trials 3 \
+    --seed 7 --replan 10 --refs 8 --probes 1,2,3,4,5,6,8,10,12,15,20,25,30 \
+    --ms 5,10,20 --m-main 10 --taus 0.3,0.5,0.7 --tau-main 0.5
+$PY scripts/staleness_figure.py ckpt/staleness/pi0_libero_spatial_s7.json \
+    --out ckpt/staleness/staleness_pi0
 $PY scripts/stage_latency.py
-
-# does draw disagreement predict error?
 $PY scripts/certificate_diagnostic.py
-
-# side-by-side video of episodes where exactly one side succeeds
-$PY scripts/render_compare.py --net checkpoints/spnet_g0.pt --seed 17 \
-    --render both --max-clips 9 --out-dir clips
 ```
 
-`render_compare.py` runs a scan pass and then re-runs the divergent episodes
-with rendering on. Feed `--scan-json` a previous scan to skip the first pass;
-the file is a list of `{task, trial, language, baseline, adaptive}`, so it can
-also be synthesised from an evaluation JSON.
+The probe runs 12 episodes and ~1,950 probes in about 17 minutes on an RTX 5090; nothing in it is
+scored by rollout.
