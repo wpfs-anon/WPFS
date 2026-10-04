@@ -13,6 +13,10 @@ prefix on which they agree is executed. A failed check falls back to a full plan
 
 The policies are used unmodified and frozen throughout.
 
+**Checkpoints.** The trained students are attached to this repository's release, since each is
+over GitHub's 100 MB file limit. `bash setup/03c_fetch_checkpoints.sh` downloads all of them
+into `checkpoints/` and checks every file against its SHA256; no account or token is needed.
+
 ## Results
 
 Success rate in %, speedup over the policy's default schedule in the last column. Speedups are
