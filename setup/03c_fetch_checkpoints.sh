@@ -12,12 +12,14 @@ cd "$HERE"
 OWNER=wpfs-anon REPO=WPFS
 URL=https://github.com/$OWNER/$REPO/releases/download/checkpoints
 
-# sha256                                                            destination
-while read -r sha dst; do
+# The release holds one flat file per student, so a destination under pi0/ or
+# dboft/ is fetched under the prefixed name it carries there.
+# sha256                                                            destination                          asset
+while read -r sha dst asset; do
   if [ ! -f "$dst" ]; then
     mkdir -p "$(dirname "$dst")"
     echo "downloading $dst"
-    curl -fL --retry 3 -o "$dst.part" "$URL/$(basename "$dst")"
+    curl -fL --retry 3 -o "$dst.part" "$URL/${asset:-$(basename "$dst")}"
     mv "$dst.part" "$dst"
   fi
   echo "$sha  $dst" | sha256sum -c -
@@ -27,7 +29,7 @@ done <<'EOF'
 55f0cad1037933c5dc908820133c5e375daa1e562057820e45f841e49424d6b7 checkpoints/pi05/st_ft_goal_g0.pt
 93d0ec7b43e99d16cf28adf00d04b64770f5d3026ffb90cc89bc78c621cf8758 checkpoints/pi05/st_long_pe_g0.pt
 2dcad9a910c78c9d738bfc407cbdc81b04a4d274115cffc85025458db24e6f88 checkpoints/pi05/st_r8_g0.pt
-724c5a50893ea81625dd064c0c0f5020706344b2d3917859d2781d6cf03cfda8 checkpoints/spnet_g0.pt
-933dbbd380ade02308c772af26099f8f557e88071818aa3af66c43dbae0f4935 checkpoints/final30_14-12.pt
+4ac5c725df936afe744267317c3523c28e5e911a84461a91f5a04e2e01b2a2c4 checkpoints/pi0/student.pt pi0_student.pt
+6555180fc3819c853e751b36b7c89fba77287ce4bbaf37f982f920b4c9e16ea8 checkpoints/dboft/student.pt dboft_student.pt
 EOF
 echo "checkpoints ready"

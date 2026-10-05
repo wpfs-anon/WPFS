@@ -16,8 +16,8 @@ for label, path in (
         ("tokenizer", HOME / "assets" / "paligemma_tokenizer.model"),
         ("openpi", HOME / "openpi" / "src"),
         ("LIBERO", HOME / "LIBERO"),
-        ("LoRA student", HOME / "checkpoints" / "final30_14-12.pt"),
-        ("network student", HOME / "checkpoints" / "spnet_g0.pt")):
+        ("pi0 student", HOME / "checkpoints" / "pi0" / "student.pt"),
+        ("pi0.5 student", HOME / "checkpoints" / "pi05" / "st_long_pe_g0.pt")):
     good = path.exists()
     ok &= good
     print(f"  [{'ok ' if good else 'MISSING'}] {label:<18} {path}")

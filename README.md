@@ -125,7 +125,7 @@ baselines/      libero/: SpecPrune-VLA, VLA-Cache, EfficientVLA, AAC on pi0 and 
 setup/          environments, upstream sources, checkpoint download, client patches
 checkpoints/    downloaded by setup/03c_fetch_checkpoints.sh
                 pi05/: the four pi0.5 students and st_r8, their common initialisation;
-                pi0/, dboft/: the π0 and DB-OFT students (added with the final checkpoints)
+                pi0/, dboft/: the π0 and DB-OFT students
 data/           inputs the pipelines read: dboft/ (certificate reference spread, training scenes),
                 latency/ (the per-call latencies the π0 rows were priced with)
 videos/         real/: the two real-robot clips; pi05/: LIBERO clips
